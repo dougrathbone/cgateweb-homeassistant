@@ -1,6 +1,6 @@
-# C-Gate Web Bridge - Home Assistant Addon
+# C-Gate Web Bridge - Home Assistant Add-on
 
-**🚨 This repository is automatically generated for HACS distribution only.**
+**🚨 This repository is automatically generated for Home Assistant add-on distribution only.**
 
 ## For Development, Issues, and Contributions
 
@@ -13,18 +13,16 @@
 - **Submit PRs**: [Pull Requests](https://github.com/dougrathbone/cgateweb/pulls)
 - **Documentation**: [Main Docs](https://github.com/dougrathbone/cgateweb#readme)
 
-### 📦 HACS Installation
+### 📦 Home Assistant Add-on Installation
 
-1. **Add Custom Repository**:
-   - Go to HACS → Integrations
-   - Click the 3-dot menu → Custom repositories
-   - Add: `https://github.com/dougrathbone/cgateweb-hacs`
-   - Category: Add-on
+1. **Add Repository**:
+   - Go to Home Assistant → Add-on Store → ⋮ → Repositories
+   - Add: `https://github.com/dougrathbone/cgateweb-homeassistant`
 
-2. **Install Addon**:
-   - Search for "cgateweb" 
-   - Install the addon
-   - Configure in Settings → Add-ons → cgateweb
+2. **Install Add-on**:
+   - Find "C-Gate Web Bridge" in the add-on store
+   - Install the add-on
+   - Configure in Settings → Add-ons → C-Gate Web Bridge
 
 ## About C-Gate Web Bridge
 
