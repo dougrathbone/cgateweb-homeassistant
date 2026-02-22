@@ -39,16 +39,56 @@ class HaDiscovery {
      * @param {Object} settings - Configuration settings
      * @param {Function} publishFn - Function to publish MQTT messages: (topic, payload, options) => void
      * @param {Function} sendCommandFn - Function to send C-Gate commands: (command) => void
+     * @param {Object} [labelData] - Optional label data object from LabelLoader.getLabelData()
+     * @param {Map<string, string>} [labelData.labels] - Label overrides keyed by "network/app/group"
+     * @param {Map<string, string>} [labelData.typeOverrides] - Type overrides ("cover"|"switch"|"light")
+     * @param {Map<string, string>} [labelData.entityIds] - Entity ID hints (object_id for HA)
+     * @param {Set<string>} [labelData.exclude] - Addresses to skip during discovery
      */
-    constructor(settings, publishFn, sendCommandFn) {
+    constructor(settings, publishFn, sendCommandFn, labelData = null) {
         this.settings = settings;
         this._publish = publishFn;
         this._sendCommand = sendCommandFn;
+        this._applyLabelData(labelData);
         
-        this.treeBuffer = '';
+        this.treeBufferParts = [];
         this.treeNetwork = null;
         this.discoveryCount = 0;
+        this.labelStats = { custom: 0, treexml: 0, fallback: 0 };
         this.logger = createLogger({ component: 'HaDiscovery' });
+    }
+
+    /**
+     * Replace the label data (used for hot-reload).
+     * Accepts either a full labelData object or a plain Map for backward compatibility.
+     * @param {Object|Map<string, string>} labelData
+     */
+    updateLabels(labelData) {
+        this._applyLabelData(labelData);
+        const parts = [`${this.labelMap.size} labels`];
+        if (this.typeOverrides.size > 0) parts.push(`${this.typeOverrides.size} type overrides`);
+        if (this.entityIds.size > 0) parts.push(`${this.entityIds.size} entity IDs`);
+        if (this.exclude.size > 0) parts.push(`${this.exclude.size} excluded`);
+        this.logger.info(`Label data updated (${parts.join(', ')})`);
+    }
+
+    _applyLabelData(labelData) {
+        if (labelData instanceof Map) {
+            this.labelMap = labelData;
+            this.typeOverrides = new Map();
+            this.entityIds = new Map();
+            this.exclude = new Set();
+        } else if (labelData && typeof labelData === 'object') {
+            this.labelMap = labelData.labels || new Map();
+            this.typeOverrides = labelData.typeOverrides || new Map();
+            this.entityIds = labelData.entityIds || new Map();
+            this.exclude = labelData.exclude || new Set();
+        } else {
+            this.labelMap = new Map();
+            this.typeOverrides = new Map();
+            this.entityIds = new Map();
+            this.exclude = new Set();
+        }
     }
 
     trigger() {
@@ -85,20 +125,20 @@ class HaDiscovery {
 
     handleTreeStart(_statusData) {
         this.logger.info(`Started receiving TreeXML. Network: ${this.treeNetwork || 'unknown'}`);
-        this.treeBuffer = '';
+        this.treeBufferParts = [];
     }
 
     handleTreeData(statusData) {
-        this.treeBuffer += statusData + NEWLINE;
+        this.treeBufferParts.push(statusData);
     }
 
     handleTreeEnd(_statusData) {
-        this.logger.info(`Finished receiving TreeXML. Network: ${this.treeNetwork || 'unknown'}. Size: ${this.treeBuffer.length} bytes. Parsing...`);
+        const treeXmlData = this.treeBufferParts.join(NEWLINE) + (this.treeBufferParts.length > 0 ? NEWLINE : '');
+        this.logger.info(`Finished receiving TreeXML. Network: ${this.treeNetwork || 'unknown'}. Size: ${treeXmlData.length} bytes. Parsing...`);
         const networkForTree = this.treeNetwork;
-        const treeXmlData = this.treeBuffer;
         
         // Clear buffer and network context immediately
-        this.treeBuffer = ''; 
+        this.treeBufferParts = []; 
         this.treeNetwork = null; 
 
         if (!networkForTree || !treeXmlData) {
@@ -140,6 +180,15 @@ class HaDiscovery {
              return;
         }
 
+        // Snapshot label data references so a concurrent updateLabels() call
+        // cannot swap them out mid-operation, preventing inconsistent reads.
+        const labelSnapshot = {
+            labelMap: this.labelMap,
+            typeOverrides: this.typeOverrides,
+            entityIds: this.entityIds,
+            exclude: this.exclude
+        };
+
         let units = networkData.Unit || [];
         if (!Array.isArray(units)) {
             units = [units];
@@ -152,6 +201,7 @@ class HaDiscovery {
         const pirAppId = this.settings.ha_discovery_pir_app_id;
         const targetApps = [lightingAppId, coverAppId, switchAppId, relayAppId, pirAppId].filter(Boolean).map(String);
         this.discoveryCount = 0;
+        this.labelStats = { custom: 0, treexml: 0, fallback: 0 };
 
         // C-Gate TREEXML returns two formats depending on version/path:
         //   Structured: unit.Application = [{ ApplicationAddress, Group: [{GroupAddress, Label}] }]
@@ -167,14 +217,20 @@ class HaDiscovery {
         for (const [appId, groupMap] of groupsByApp) {
             const groups = Array.from(groupMap.values());
             if (String(appId) === String(lightingAppId)) {
-                this._processLightingGroups(networkId, appId, groups);
+                this._processLightingGroups(networkId, appId, groups, labelSnapshot);
             } else {
-                this._processEnableControlGroups(networkId, appId, groups);
+                this._processEnableControlGroups(networkId, appId, groups, labelSnapshot);
             }
         }
 
+        // Supplement with labeled groups not found in TREEXML.
+        // C-Gate's flat TREEXML format omits groups not assigned to specific units,
+        // but labels.json may define groups that are valid and controllable.
+        this._supplementFromLabels(networkId, lightingAppId, groupsByApp, labelSnapshot);
+
         const duration = Date.now() - startTime;
-        this.logger.info(`HA Discovery completed for network ${networkId}. Published ${this.discoveryCount} entities (took ${duration}ms)`);
+        const { custom, treexml, fallback } = this.labelStats;
+        this.logger.info(`HA Discovery completed for network ${networkId}. Published ${this.discoveryCount} entities (took ${duration}ms). Labels: ${custom} custom, ${treexml} from TREEXML, ${fallback} fallback`);
     }
 
     /**
@@ -223,6 +279,35 @@ class HaDiscovery {
     }
 
     /**
+     * Create discovery entities for labeled groups not already found in TREEXML.
+     * The flat TREEXML format may omit groups not assigned to specific units,
+     * but they are still valid and controllable on the C-Bus network.
+     */
+    _supplementFromLabels(networkId, lightingAppId, groupsByApp, labelSnapshot) {
+        const { labelMap, exclude } = labelSnapshot;
+        if (!labelMap || labelMap.size === 0) return;
+
+        const prefix = `${networkId}/${lightingAppId}/`;
+        const existingGroups = groupsByApp.get(String(lightingAppId));
+        const existingIds = existingGroups ? new Set(existingGroups.keys()) : new Set();
+        let supplementCount = 0;
+
+        for (const [labelKey] of labelMap) {
+            if (!labelKey.startsWith(prefix)) continue;
+            const groupId = labelKey.substring(prefix.length);
+            if (existingIds.has(groupId)) continue;
+            if (exclude.has(labelKey)) continue;
+
+            this._processLightingGroups(networkId, lightingAppId, [{ GroupAddress: groupId }], labelSnapshot);
+            supplementCount++;
+        }
+
+        if (supplementCount > 0) {
+            this.logger.info(`Supplemented ${supplementCount} additional groups from label data for network ${networkId}`);
+        }
+    }
+
+    /**
      * Locate the Network node within parsed TreeXML, handling different
      * XML structures that C-Gate versions may produce.
      */
@@ -260,7 +345,8 @@ class HaDiscovery {
         return null;
     }
 
-    _processLightingGroups(networkId, appId, groups) {
+    _processLightingGroups(networkId, appId, groups, labelSnapshot) {
+        const { labelMap, typeOverrides, entityIds, exclude } = labelSnapshot;
         const groupArray = Array.isArray(groups) ? groups : [groups];
         
         groupArray.forEach(group => {
@@ -270,14 +356,42 @@ class HaDiscovery {
                 return;
             }
 
+            const labelKey = `${networkId}/${appId}/${groupId}`;
+
+            if (exclude.has(labelKey)) {
+                this.logger.debug(`Excluding group ${labelKey} from discovery`);
+                return;
+            }
+
+            const typeOverride = typeOverrides.get(labelKey);
+            if (typeOverride && typeOverride !== 'light') {
+                const config = this._getDiscoveryConfig(typeOverride);
+                if (config) {
+                    this.logger.debug(`Type override: ${labelKey} -> ${typeOverride}`);
+                    this._createDiscovery(networkId, appId, groupId, group.Label, config, labelSnapshot);
+                    // Remove any stale retained light config for this group
+                    const uniqueId = `cgateweb_${networkId}_${appId}_${groupId}`;
+                    const staleTopic = `${this.settings.ha_discovery_prefix}/${HA_COMPONENT_LIGHT}/${uniqueId}/${HA_DISCOVERY_SUFFIX}`;
+                    this._publish(staleTopic, '', { retain: true, qos: 0 });
+                    return;
+                }
+                this.logger.warn(`Unknown type override "${typeOverride}" for ${labelKey}, falling back to light`);
+            }
+
+            const customLabel = labelMap.get(labelKey);
             const groupLabel = group.Label;
-            const finalLabel = groupLabel || `CBus Light ${networkId}/${appId}/${groupId}`;
+            const finalLabel = customLabel || groupLabel || `CBus Light ${networkId}/${appId}/${groupId}`;
+            if (customLabel) this.labelStats.custom++;
+            else if (groupLabel) this.labelStats.treexml++;
+            else this.labelStats.fallback++;
             const uniqueId = `cgateweb_${networkId}_${appId}_${groupId}`;
+            const entityId = entityIds.get(labelKey);
             const discoveryTopic = `${this.settings.ha_discovery_prefix}/${HA_COMPONENT_LIGHT}/${uniqueId}/${HA_DISCOVERY_SUFFIX}`;
 
             const payload = { 
-                name: finalLabel,
+                name: null,
                 unique_id: uniqueId,
+                ...(entityId && { object_id: entityId }),
                 state_topic: `${MQTT_TOPIC_PREFIX_READ}/${networkId}/${appId}/${groupId}/${MQTT_TOPIC_SUFFIX_STATE}`,
                 command_topic: `${MQTT_TOPIC_PREFIX_WRITE}/${networkId}/${appId}/${groupId}/${MQTT_CMD_TYPE_RAMP}`,
                 brightness_state_topic: `${MQTT_TOPIC_PREFIX_READ}/${networkId}/${appId}/${groupId}/${MQTT_TOPIC_SUFFIX_LEVEL}`,
@@ -309,7 +423,7 @@ class HaDiscovery {
         });
     }
 
-    _processEnableControlGroups(networkId, appAddress, groups) {
+    _processEnableControlGroups(networkId, appAddress, groups, labelSnapshot) {
         const groupArray = Array.isArray(groups) ? groups : [groups];
         
         // Determine the discovery type based on application address
@@ -325,7 +439,7 @@ class HaDiscovery {
                 return;
             }
 
-            this._createDiscovery(networkId, appAddress, groupId, group.Label, this._getDiscoveryConfig(discoveryType));
+            this._createDiscovery(networkId, appAddress, groupId, group.Label, this._getDiscoveryConfig(discoveryType), labelSnapshot);
         });
     }
 
@@ -352,19 +466,31 @@ class HaDiscovery {
         return null;
     }
 
-    // Unified discovery creation method to eliminate code duplication
-    _createDiscovery(networkId, appId, groupId, groupLabel, config) {
-        const finalLabel = groupLabel || `CBus ${config.defaultType} ${networkId}/${appId}/${groupId}`;
+    _createDiscovery(networkId, appId, groupId, groupLabel, config, labelSnapshot) {
+        const { labelMap, entityIds, exclude } = labelSnapshot;
+        const labelKey = `${networkId}/${appId}/${groupId}`;
+
+        if (exclude.has(labelKey)) {
+            this.logger.debug(`Excluding group ${labelKey} from discovery`);
+            return;
+        }
+
+        const customLabel = labelMap.get(labelKey);
+        const finalLabel = customLabel || groupLabel || `CBus ${config.defaultType} ${networkId}/${appId}/${groupId}`;
+        if (customLabel) this.labelStats.custom++;
+        else if (groupLabel) this.labelStats.treexml++;
+        else this.labelStats.fallback++;
         const uniqueId = `cgateweb_${networkId}_${appId}_${groupId}`;
+        const entityId = entityIds.get(labelKey);
         const discoveryTopic = `${this.settings.ha_discovery_prefix}/${config.component}/${uniqueId}/${HA_DISCOVERY_SUFFIX}`;
         
         const payload = { 
-            name: finalLabel,
+            name: null,
             unique_id: uniqueId,
+            ...(entityId && { object_id: entityId }),
             state_topic: `${MQTT_TOPIC_PREFIX_READ}/${networkId}/${appId}/${groupId}/${MQTT_TOPIC_SUFFIX_STATE}`,
             ...(!config.omitCommandTopic && { command_topic: `${MQTT_TOPIC_PREFIX_WRITE}/${networkId}/${appId}/${groupId}/${MQTT_CMD_TYPE_SWITCH}` }),
             ...config.payloads,
-            // Add position topics for covers
             ...(config.positionSupport && {
                 position_topic: `${MQTT_TOPIC_PREFIX_READ}/${networkId}/${appId}/${groupId}/${MQTT_TOPIC_SUFFIX_POSITION}`,
                 set_position_topic: `${MQTT_TOPIC_PREFIX_WRITE}/${networkId}/${appId}/${groupId}/${MQTT_CMD_TYPE_POSITION}`,

@@ -10,6 +10,8 @@ const ConnectionManager = require('./connectionManager');
 const EventPublisher = require('./eventPublisher');
 const CommandResponseProcessor = require('./commandResponseProcessor');
 const DeviceStateManager = require('./deviceStateManager');
+const LabelLoader = require('./labelLoader');
+const WebServer = require('./webServer');
 const { createLogger } = require('./logger');
 const { LineProcessor } = require('./lineProcessor');
 const {
@@ -89,19 +91,12 @@ class CgateWebBridge {
         // Service modules (haDiscovery will be initialized after pool starts)
         this.haDiscovery = null;
         
-        // Message queues with configurable size limits
+        // C-Gate command queue with throttling to avoid overwhelming serial protocol
         const queueOptions = { maxSize: this.settings.maxQueueSize || 1000 };
         this.cgateCommandQueue = new ThrottledQueue(
             (command) => this._sendCgateCommand(command),
             this.settings.messageinterval,
             'C-Gate Command Queue',
-            queueOptions
-        );
-        
-        this.mqttPublishQueue = new ThrottledQueue(
-            (message) => this._publishMqttMessage(message),
-            this.settings.messageinterval,
-            'MQTT Publish Queue',
             queueOptions
         );
 
@@ -130,10 +125,12 @@ class CgateWebBridge {
         // MQTT options
         this._mqttOptions = this.settings.retainreads ? { retain: true, qos: 0 } : { qos: 0 };
 
-        // Event publisher for MQTT messages
+        // Event publisher for MQTT messages -- publishes directly without throttling.
+        // MQTT QoS 0 publishes are near-instant TCP buffer writes; the mqtt library
+        // handles its own buffering and flow control.
         this.eventPublisher = new EventPublisher({
             settings: this.settings,
-            mqttPublishQueue: this.mqttPublishQueue,
+            publishFn: (topic, payload, options) => this.mqttManager.publish(topic, payload, options),
             mqttOptions: this._mqttOptions,
             logger: this.logger
         });
@@ -144,6 +141,19 @@ class CgateWebBridge {
             haDiscovery: null, // Will be set after haDiscovery is initialized
             onObjectStatus: (event) => this.deviceStateManager.updateLevelFromEvent(event),
             logger: this.logger
+        });
+
+        // Label loader for custom device names
+        this.labelLoader = new LabelLoader(this.settings.cbus_label_file || null);
+        this.labelLoader.load();
+
+        // Web server for label editing UI
+        const ingressBasePath = process.env.INGRESS_ENTRY || '';
+        this.webServer = new WebServer({
+            port: this.settings.web_port || 8080,
+            basePath: ingressBasePath,
+            labelLoader: this.labelLoader,
+            getStatus: () => this._getBridgeStatus()
         });
 
         this._setupEventHandlers();
@@ -159,6 +169,16 @@ class CgateWebBridge {
         this.commandConnectionPool.on('started', () => {
             const firstConnection = this.commandConnectionPool.connections[0];
             this.commandConnection = firstConnection;
+        });
+
+        // Reset line processor when a pool connection is replaced (reconnect)
+        // to avoid stale partial-line buffers from the old connection
+        this.commandConnectionPool.on('connectionAdded', ({ index }) => {
+            const existing = this.commandLineProcessors.get(index);
+            if (existing) {
+                existing.close();
+                this.commandLineProcessors.delete(index);
+            }
         });
 
         // MQTT message routing
@@ -194,6 +214,13 @@ class CgateWebBridge {
     async start() {
         this.logger.info('Starting cgateweb bridge');
         
+        // Start web server
+        try {
+            await this.webServer.start();
+        } catch (err) {
+            this.logger.warn(`Web server failed to start: ${err.message}`);
+        }
+        
         // Start all connections via connection manager
         await this.connectionManager.start();
         
@@ -218,9 +245,18 @@ class CgateWebBridge {
             this.periodicGetAllInterval = null;
         }
 
+        // Stop label file watcher and remove listener
+        if (this._onLabelsChanged) {
+            this.labelLoader.removeListener('labels-changed', this._onLabelsChanged);
+            this._onLabelsChanged = null;
+        }
+        this.labelLoader.unwatch();
+
+        // Stop web server
+        await this.webServer.close();
+
         // Clear queues
         this.cgateCommandQueue.clear();
-        this.mqttPublishQueue.clear();
 
         // Clean up line processors
         for (const processor of this.commandLineProcessors.values()) {
@@ -263,14 +299,24 @@ class CgateWebBridge {
             }, this.settings.getallperiod * 1000);
         }
         
-        // Initialize haDiscovery after pool starts
+        // Initialize haDiscovery after pool starts, with label data
         if (!this.haDiscovery) {
             this.haDiscovery = new HaDiscovery(
                 this.settings,
                 (topic, payload, options) => this.mqttManager.publish(topic, payload, options),
-                (command) => this._sendCgateCommand(command)
+                (command) => this._sendCgateCommand(command),
+                this.labelLoader.getLabelData()
             );
             this.commandResponseProcessor.haDiscovery = this.haDiscovery;
+
+            // Start label file watcher after haDiscovery exists so updates are never dropped
+            this._onLabelsChanged = (labelData) => {
+                this.logger.info(`Labels reloaded (${labelData.labels.size} labels), re-triggering HA Discovery`);
+                this.haDiscovery.updateLabels(labelData);
+                this.haDiscovery.trigger();
+            };
+            this.labelLoader.on('labels-changed', this._onLabelsChanged);
+            this.labelLoader.watch();
         }
         
         // Trigger HA Discovery
@@ -284,10 +330,11 @@ class CgateWebBridge {
 
 
     _handleCommandData(data, connection) {
-        let processor = this.commandLineProcessors.get(connection);
+        const key = connection.poolIndex !== undefined ? connection.poolIndex : connection;
+        let processor = this.commandLineProcessors.get(key);
         if (!processor) {
             processor = new LineProcessor();
-            this.commandLineProcessors.set(connection, processor);
+            this.commandLineProcessors.set(key, processor);
         }
         processor.processData(data, (line) => {
             this.commandResponseProcessor.processLine(line);
@@ -335,10 +382,6 @@ class CgateWebBridge {
         }
     }
 
-    _publishMqttMessage(message) {
-        this.mqttManager.publish(message.topic, message.payload, message.options);
-    }
-
     /**
      * Logs an informational message.
      * 
@@ -367,6 +410,22 @@ class CgateWebBridge {
      */
     error(message, meta = {}) {
         this.logger.error(message, meta);
+    }
+
+    _getBridgeStatus() {
+        return {
+            version: require('../package.json').version,
+            uptime: process.uptime(),
+            connections: {
+                mqtt: this.mqttManager.isConnected ? this.mqttManager.isConnected() : 'unknown',
+                commandPool: this.commandConnectionPool ? 'active' : 'inactive',
+                event: this.eventConnection ? 'active' : 'inactive'
+            },
+            discovery: this.haDiscovery ? {
+                count: this.haDiscovery.discoveryCount,
+                labelStats: this.haDiscovery.labelStats
+            } : null
+        };
     }
 
     // Legacy method compatibility for tests
