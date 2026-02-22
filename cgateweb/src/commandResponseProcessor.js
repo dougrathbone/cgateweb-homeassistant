@@ -77,11 +77,9 @@ class CommandResponseProcessor {
             }
         }
         
-        // C-Gate response codes are 3-digit numbers starting with 1-6 (like HTTP status codes).
-        // Non-matching lines (e.g., C-Gate v3.6.0 timestamp-prefixed notifications) are
-        // harmless and logged at debug to avoid alarming users.
+        // C-Gate response codes are 3-digit numbers starting with 1-6 (like HTTP status codes)
         if (!responseCode || !/^[1-6]\d{2}$/.test(responseCode)) {
-             this.logger.debug(`Skipping non-response line: ${line}`);
+             this.logger.info(`Skipping invalid command response line: ${line}`);
              return null; 
         }
 
@@ -123,10 +121,8 @@ class CommandResponseProcessor {
             default:
                 if (responseCode.startsWith('4') || responseCode.startsWith('5')) {
                     this._processCommandErrorResponse(responseCode, statusData);
-                } else if (responseCode === '200' || responseCode === '201') {
-                    this.logger.debug(`C-Gate info ${responseCode}: ${statusData}`);
                 } else {
-                    this.logger.debug(`Unhandled C-Gate response ${responseCode}: ${statusData}`);
+                    this.logger.info(`Unhandled C-Gate response ${responseCode}: ${statusData}`);
                 }
         }
     }

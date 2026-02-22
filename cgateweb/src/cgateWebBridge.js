@@ -10,8 +10,6 @@ const ConnectionManager = require('./connectionManager');
 const EventPublisher = require('./eventPublisher');
 const CommandResponseProcessor = require('./commandResponseProcessor');
 const DeviceStateManager = require('./deviceStateManager');
-const LabelLoader = require('./labelLoader');
-const WebServer = require('./webServer');
 const { createLogger } = require('./logger');
 const { LineProcessor } = require('./lineProcessor');
 const {
@@ -143,19 +141,6 @@ class CgateWebBridge {
             logger: this.logger
         });
 
-        // Label loader for custom device names
-        this.labelLoader = new LabelLoader(this.settings.cbus_label_file || null);
-        this.labelLoader.load();
-
-        // Web server for label editing UI
-        const ingressBasePath = process.env.INGRESS_ENTRY || '';
-        this.webServer = new WebServer({
-            port: this.settings.web_port || 8080,
-            basePath: ingressBasePath,
-            labelLoader: this.labelLoader,
-            getStatus: () => this._getBridgeStatus()
-        });
-
         this._setupEventHandlers();
     }
 
@@ -214,13 +199,6 @@ class CgateWebBridge {
     async start() {
         this.logger.info('Starting cgateweb bridge');
         
-        // Start web server
-        try {
-            await this.webServer.start();
-        } catch (err) {
-            this.logger.warn(`Web server failed to start: ${err.message}`);
-        }
-        
         // Start all connections via connection manager
         await this.connectionManager.start();
         
@@ -244,16 +222,6 @@ class CgateWebBridge {
             clearInterval(this.periodicGetAllInterval);
             this.periodicGetAllInterval = null;
         }
-
-        // Stop label file watcher and remove listener
-        if (this._onLabelsChanged) {
-            this.labelLoader.removeListener('labels-changed', this._onLabelsChanged);
-            this._onLabelsChanged = null;
-        }
-        this.labelLoader.unwatch();
-
-        // Stop web server
-        await this.webServer.close();
 
         // Clear queues
         this.cgateCommandQueue.clear();
@@ -299,24 +267,14 @@ class CgateWebBridge {
             }, this.settings.getallperiod * 1000);
         }
         
-        // Initialize haDiscovery after pool starts, with label data
+        // Initialize haDiscovery after pool starts
         if (!this.haDiscovery) {
             this.haDiscovery = new HaDiscovery(
                 this.settings,
                 (topic, payload, options) => this.mqttManager.publish(topic, payload, options),
-                (command) => this._sendCgateCommand(command),
-                this.labelLoader.getLabelData()
+                (command) => this._sendCgateCommand(command)
             );
             this.commandResponseProcessor.haDiscovery = this.haDiscovery;
-
-            // Start label file watcher after haDiscovery exists so updates are never dropped
-            this._onLabelsChanged = (labelData) => {
-                this.logger.info(`Labels reloaded (${labelData.labels.size} labels), re-triggering HA Discovery`);
-                this.haDiscovery.updateLabels(labelData);
-                this.haDiscovery.trigger();
-            };
-            this.labelLoader.on('labels-changed', this._onLabelsChanged);
-            this.labelLoader.watch();
         }
         
         // Trigger HA Discovery
@@ -410,22 +368,6 @@ class CgateWebBridge {
      */
     error(message, meta = {}) {
         this.logger.error(message, meta);
-    }
-
-    _getBridgeStatus() {
-        return {
-            version: require('../package.json').version,
-            uptime: process.uptime(),
-            connections: {
-                mqtt: this.mqttManager.isConnected ? this.mqttManager.isConnected() : 'unknown',
-                commandPool: this.commandConnectionPool ? 'active' : 'inactive',
-                event: this.eventConnection ? 'active' : 'inactive'
-            },
-            discovery: this.haDiscovery ? {
-                count: this.haDiscovery.discoveryCount,
-                labelStats: this.haDiscovery.labelStats
-            } : null
-        };
     }
 
     // Legacy method compatibility for tests
