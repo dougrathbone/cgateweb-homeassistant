@@ -1,8 +1,7 @@
-const { EventEmitter } = require('events');
 const CgateConnection = require('./cgateConnection');
 const CgateConnectionPool = require('./cgateConnectionPool');
 const MqttManager = require('./mqttManager');
-const HaDiscovery = require('./haDiscovery');
+const BridgeInitializationService = require('./bridgeInitializationService');
 const ThrottledQueue = require('./throttledQueue');
 const CBusEvent = require('./cbusEvent');
 const MqttCommandRouter = require('./mqttCommandRouter');
@@ -14,11 +13,6 @@ const LabelLoader = require('./labelLoader');
 const WebServer = require('./webServer');
 const { createLogger } = require('./logger');
 const { LineProcessor } = require('./lineProcessor');
-const {
-    CGATE_CMD_GET,
-    CGATE_PARAM_LEVEL,
-    NEWLINE
-} = require('./constants');
 
 /**
  * Main bridge class that connects C-Gate (Clipsal C-Bus automation system) to MQTT.
@@ -125,6 +119,10 @@ class CgateWebBridge {
         // MQTT options
         this._mqttOptions = this.settings.retainreads ? { retain: true, qos: 0 } : { qos: 0 };
 
+        // Label loader for custom device names (before EventPublisher so it can use type overrides)
+        this.labelLoader = new LabelLoader(this.settings.cbus_label_file || null);
+        this.labelLoader.load();
+
         // Event publisher for MQTT messages -- publishes directly without throttling.
         // MQTT QoS 0 publishes are near-instant TCP buffer writes; the mqtt library
         // handles its own buffering and flow control.
@@ -132,6 +130,7 @@ class CgateWebBridge {
             settings: this.settings,
             publishFn: (topic, payload, options) => this.mqttManager.publish(topic, payload, options),
             mqttOptions: this._mqttOptions,
+            labelLoader: this.labelLoader,
             logger: this.logger
         });
 
@@ -143,19 +142,20 @@ class CgateWebBridge {
             logger: this.logger
         });
 
-        // Label loader for custom device names
-        this.labelLoader = new LabelLoader(this.settings.cbus_label_file || null);
-        this.labelLoader.load();
-
         // Web server for label editing UI
         const ingressBasePath = process.env.INGRESS_ENTRY || '';
         this.webServer = new WebServer({
             port: this.settings.web_port || 8080,
+            bindHost: this.settings.web_bind_host || '127.0.0.1',
             basePath: ingressBasePath,
             labelLoader: this.labelLoader,
+            apiKey: this.settings.web_api_key || null,
+            allowedOrigins: this.settings.web_allowed_origins || null,
+            maxMutationRequestsPerWindow: this.settings.web_mutation_rate_limit_per_minute || 120,
             getStatus: () => this._getBridgeStatus()
         });
 
+        this.initializationService = new BridgeInitializationService(this);
         this._setupEventHandlers();
     }
 
@@ -164,6 +164,11 @@ class CgateWebBridge {
         this.connectionManager.on('allConnected', () => {
             this._handleAllConnected();
         });
+        this.commandConnectionPool.on('allConnectionsUnhealthy', () => this._updateBridgeReadiness('command-pool-unhealthy'));
+        this.commandConnectionPool.on('connectionLost', () => this._updateBridgeReadiness('command-pool-connection-lost'));
+        this.eventConnection.on('close', () => this._updateBridgeReadiness('event-disconnected'));
+        this.eventConnection.on('error', () => this._updateBridgeReadiness('event-error'));
+        this.mqttManager.on('close', () => this._updateBridgeReadiness('mqtt-disconnected'));
 
         // Set first connection for backward compatibility when pool starts
         this.commandConnectionPool.on('started', () => {
@@ -213,6 +218,7 @@ class CgateWebBridge {
      */
     async start() {
         this.logger.info('Starting cgateweb bridge');
+        this._updateBridgeReadiness('startup');
         
         // Start web server
         try {
@@ -238,19 +244,9 @@ class CgateWebBridge {
      */
     async stop() {
         this.log(`Stopping cgateweb bridge...`);
+        this._updateBridgeReadiness('shutdown');
         
-        // Clear periodic tasks
-        if (this.periodicGetAllInterval) {
-            clearInterval(this.periodicGetAllInterval);
-            this.periodicGetAllInterval = null;
-        }
-
-        // Stop label file watcher and remove listener
-        if (this._onLabelsChanged) {
-            this.labelLoader.removeListener('labels-changed', this._onLabelsChanged);
-            this._onLabelsChanged = null;
-        }
-        this.labelLoader.unwatch();
+        this.initializationService.stop();
 
         // Stop web server
         await this.webServer.close();
@@ -273,56 +269,7 @@ class CgateWebBridge {
     }
 
     _handleAllConnected() {
-        const now = Date.now();
-        if (now - this._lastInitTime < 10000) {
-            this.log(`ALL CONNECTED (duplicate within 10s, skipping re-initialization)`);
-            return;
-        }
-        this._lastInitTime = now;
-        this.log(`ALL CONNECTED - Initializing services...`);
-
-        // Trigger initial get all
-        if (this.settings.getallnetapp && this.settings.getallonstart) {
-            this.log(`Getting all initial values for ${this.settings.getallnetapp}...`);
-            this.cgateCommandQueue.add(`${CGATE_CMD_GET} //${this.settings.cbusname}/${this.settings.getallnetapp}/* ${CGATE_PARAM_LEVEL}${NEWLINE}`);
-        }
-
-        // Setup periodic get all
-        if (this.settings.getallnetapp && this.settings.getallperiod) {
-            if (this.periodicGetAllInterval) {
-                clearInterval(this.periodicGetAllInterval);
-            }
-            this.log(`Starting periodic 'get all' every ${this.settings.getallperiod} seconds.`);
-            this.periodicGetAllInterval = setInterval(() => {
-                this.log(`Getting all periodic values for ${this.settings.getallnetapp}...`);
-                this.cgateCommandQueue.add(`${CGATE_CMD_GET} //${this.settings.cbusname}/${this.settings.getallnetapp}/* ${CGATE_PARAM_LEVEL}${NEWLINE}`);
-            }, this.settings.getallperiod * 1000);
-        }
-        
-        // Initialize haDiscovery after pool starts, with label data
-        if (!this.haDiscovery) {
-            this.haDiscovery = new HaDiscovery(
-                this.settings,
-                (topic, payload, options) => this.mqttManager.publish(topic, payload, options),
-                (command) => this._sendCgateCommand(command),
-                this.labelLoader.getLabelData()
-            );
-            this.commandResponseProcessor.haDiscovery = this.haDiscovery;
-
-            // Start label file watcher after haDiscovery exists so updates are never dropped
-            this._onLabelsChanged = (labelData) => {
-                this.logger.info(`Labels reloaded (${labelData.labels.size} labels), re-triggering HA Discovery`);
-                this.haDiscovery.updateLabels(labelData);
-                this.haDiscovery.trigger();
-            };
-            this.labelLoader.on('labels-changed', this._onLabelsChanged);
-            this.labelLoader.watch();
-        }
-        
-        // Trigger HA Discovery
-        if (this.settings.ha_discovery_enabled) {
-            this.haDiscovery.trigger();
-        }
+        this.initializationService.handleAllConnected();
     }
 
     // MQTT message handling now delegated to MqttCommandRouter
@@ -352,6 +299,11 @@ class CgateWebBridge {
     _processEventLine(line) {
         if (line.startsWith('#')) {
             this.log(`Ignoring comment from event port:`, line);
+            return;
+        }
+
+        if (line.startsWith('clock ')) {
+            this.log(`Ignoring clock event from event port:`, line);
             return;
         }
 
@@ -413,19 +365,42 @@ class CgateWebBridge {
     }
 
     _getBridgeStatus() {
+        const commandStats = this.commandConnectionPool ? this.commandConnectionPool.getStats() : null;
+        const mqttConnected = !!this.mqttManager.connected;
+        const eventConnected = !!this.eventConnection.connected;
+        const healthyCommandConnections = commandStats ? commandStats.healthyConnections : 0;
+        const ready = mqttConnected && eventConnected && healthyCommandConnections > 0;
+
         return {
             version: require('../package.json').version,
             uptime: process.uptime(),
+            ready,
             connections: {
-                mqtt: this.mqttManager.isConnected ? this.mqttManager.isConnected() : 'unknown',
-                commandPool: this.commandConnectionPool ? 'active' : 'inactive',
-                event: this.eventConnection ? 'active' : 'inactive'
+                mqtt: mqttConnected,
+                commandPool: {
+                    started: commandStats ? commandStats.isStarted : false,
+                    healthyConnections: healthyCommandConnections,
+                    totalConnections: commandStats ? commandStats.totalConnections : 0,
+                    isShuttingDown: commandStats ? commandStats.isShuttingDown : false
+                },
+                event: eventConnected
             },
             discovery: this.haDiscovery ? {
                 count: this.haDiscovery.discoveryCount,
                 labelStats: this.haDiscovery.labelStats
             } : null
         };
+    }
+
+    _updateBridgeReadiness(reason = 'state-change') {
+        const commandStats = this.commandConnectionPool ? this.commandConnectionPool.getStats() : null;
+        const ready = !!(
+            this.mqttManager.connected &&
+            this.eventConnection.connected &&
+            commandStats &&
+            commandStats.healthyConnections > 0
+        );
+        this.mqttManager.setBridgeReady(ready, reason);
     }
 
     // Legacy method compatibility for tests

@@ -32,12 +32,18 @@ try {
 } catch (error) {
     console.error(`[ERROR] Failed to load configuration: ${error.message}`);
     let envInfo;
-    try { envInfo = configLoader.getEnvironment(); } catch (_) { /* ignore */ }
+    try { envInfo = configLoader.getEnvironment(); } catch { /* ignore */ }
     if (process.env.SUPERVISOR_TOKEN || (envInfo && envInfo.isAddon)) {
         console.error('[ERROR] Please check the addon configuration and restart.');
         process.exit(1);
     }
-    console.error('[ERROR] Using default settings only');
+    const allowFallback = String(process.env.ALLOW_DEFAULT_FALLBACK || '').toLowerCase() === 'true';
+    if (!allowFallback) {
+        console.error('[ERROR] Standalone startup aborted due to invalid configuration.');
+        process.exit(1);
+    }
+    settings = { ...defaultSettings, ...configLoader.getDefaultConfig() };
+    console.error('[WARN] ALLOW_DEFAULT_FALLBACK=true set; using safe fallback settings only');
 }
 
 const envOverrides = {
@@ -71,6 +77,8 @@ async function main() {
             console.error('[WARN] MQTT auto-detection failed:', error.message);
         }
     }
+
+    configLoader.validate(settings);
     
     validateWithWarnings(settings);
     

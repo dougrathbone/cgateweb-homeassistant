@@ -265,13 +265,15 @@ class MqttCommandRouter extends EventEmitter {
         // Cancel any existing pending operation for this address to prevent duplicate handlers
         this._cancelPendingRelativeLevel(levelAddress);
 
-        let timeoutHandle;
+        function cleanup() {
+            this.internalEventEmitter.removeListener(MQTT_TOPIC_SUFFIX_LEVEL, levelHandler);
+            this._pendingRelativeLevels.delete(levelAddress);
+            clearTimeout(timeoutHandle);
+        }
 
         const levelHandler = (address, currentLevel) => {
             if (address === levelAddress) {
-                this.internalEventEmitter.removeListener(MQTT_TOPIC_SUFFIX_LEVEL, levelHandler);
-                this._pendingRelativeLevels.delete(levelAddress);
-                clearTimeout(timeoutHandle);
+                cleanup.call(this);
                 const newLevel = Math.max(CGATE_LEVEL_MIN, Math.min(limit, currentLevel + step));
                 this.logger.debug(`${actionName}: ${levelAddress} ${currentLevel} -> ${newLevel}`);
                 
@@ -280,9 +282,8 @@ class MqttCommandRouter extends EventEmitter {
             }
         };
 
-        timeoutHandle = setTimeout(() => {
-            this.internalEventEmitter.removeListener(MQTT_TOPIC_SUFFIX_LEVEL, levelHandler);
-            this._pendingRelativeLevels.delete(levelAddress);
+        const timeoutHandle = setTimeout(() => {
+            cleanup.call(this);
             this.logger.warn(`Timeout waiting for level response from ${levelAddress} during ${actionName}`);
         }, 5000);
 

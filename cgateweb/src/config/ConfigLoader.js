@@ -1,5 +1,4 @@
 const fs = require('fs');
-const path = require('path');
 const { Logger } = require('../logger');
 const EnvironmentDetector = require('./EnvironmentDetector');
 
@@ -102,7 +101,14 @@ class ConfigLoader {
             return config;
         } catch (error) {
             this.logger.error('Failed to load settings.js:', error.message);
-            this.logger.info('Falling back to default configuration');
+            const allowFallback = String(process.env.ALLOW_DEFAULT_FALLBACK || '').toLowerCase() === 'true';
+            if (!allowFallback) {
+                throw new Error(
+                    `Failed to load standalone settings from ${settingsPath}: ${error.message}. ` +
+                    'Set ALLOW_DEFAULT_FALLBACK=true to continue with defaults.'
+                );
+            }
+            this.logger.warn('ALLOW_DEFAULT_FALLBACK=true set; falling back to default configuration');
             const defaultConfig = this._getDefaultConfig();
             defaultConfig._environment.type = 'default';
             return defaultConfig;
@@ -212,6 +218,12 @@ class ConfigLoader {
         if (options.web_port) {
             config.web_port = options.web_port;
         }
+        if (options.web_api_key) {
+            config.web_api_key = options.web_api_key;
+        }
+        if (options.web_mutation_rate_limit_per_minute !== undefined && options.web_mutation_rate_limit_per_minute !== null) {
+            config.web_mutation_rate_limit_per_minute = options.web_mutation_rate_limit_per_minute;
+        }
 
         return config;
     }
@@ -262,6 +274,14 @@ class ConfigLoader {
                 loadedAt: new Date().toISOString()
             }
         };
+    }
+
+    /**
+     * Get a safe default configuration for startup fallback.
+     * @returns {Object} Default configuration object
+     */
+    getDefaultConfig() {
+        return this._getDefaultConfig();
     }
 
     /**
