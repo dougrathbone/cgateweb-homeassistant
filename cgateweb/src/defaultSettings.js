@@ -32,6 +32,9 @@ const defaultSettings = {
     keepAliveInterval: 60000,
     connectionTimeout: 5000,
     maxRetries: 3,
+    eventPublishDedupWindowMs: 0,
+    eventPublishDedupMaxEntries: 5000,
+    topicCacheMaxEntries: 5000,
     ha_discovery_enabled: false,
     ha_discovery_prefix: 'homeassistant',
     ha_discovery_networks: [],
@@ -43,6 +46,7 @@ const defaultSettings = {
     web_port: 8080,
     web_bind_host: '127.0.0.1',
     web_api_key: null,
+    web_allow_unauthenticated_mutations: false,
     web_allowed_origins: null,
     web_mutation_rate_limit_per_minute: 120
 };
