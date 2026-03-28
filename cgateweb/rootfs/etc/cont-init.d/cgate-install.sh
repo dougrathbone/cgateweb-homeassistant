@@ -34,15 +34,26 @@ mkdir -p "${CGATE_DIR}"
 if [[ "${INSTALL_SOURCE}" == "download" ]]; then
     DOWNLOAD_URL=$(bashio::config 'cgate_download_url' '')
     if [[ -z "${DOWNLOAD_URL}" ]]; then
-        DOWNLOAD_URL="https://updates.clipsal.com/ClipsalSoftwareDownload/mainsite/cis/technical/downloads/C-Gate3_Linux.zip"
+        DOWNLOAD_URL="https://download.se.com/files?p_Doc_Ref=C-Gate_3_Linux_Package_V3.3.2"
     fi
 
     bashio::log.info "Downloading C-Gate from: ${DOWNLOAD_URL}"
 
     TEMP_ZIP="${WORK_DIR}/cgate-download.zip"
-    if ! curl -fSL -o "${TEMP_ZIP}" "${DOWNLOAD_URL}" 2>&1; then
-        bashio::log.error "Failed to download C-Gate from ${DOWNLOAD_URL}"
-        bashio::log.error "Try using 'upload' install source instead"
+    HTTP_CODE=$(curl -fSL -w "%{http_code}" -o "${TEMP_ZIP}" "${DOWNLOAD_URL}" 2>"${WORK_DIR}/curl.err" || true)
+    CURL_EXIT=$?
+
+    if [[ ${CURL_EXIT} -ne 0 ]]; then
+        CURL_ERR=$(cat "${WORK_DIR}/curl.err" 2>/dev/null || echo "unknown")
+        bashio::log.error "Failed to download C-Gate (HTTP ${HTTP_CODE}, curl exit ${CURL_EXIT})"
+        bashio::log.error "URL: ${DOWNLOAD_URL}"
+        bashio::log.error "Error: ${CURL_ERR}"
+        if [[ "${HTTP_CODE}" == "404" ]]; then
+            bashio::log.error "The download URL returned 404. Schneider Electric may have updated the download location."
+            bashio::log.error "Visit https://www.se.com and search for 'C-Gate 3 Linux' to find the current URL."
+            bashio::log.error "Then set cgate_download_url in the addon configuration."
+        fi
+        bashio::log.error "Alternative: set cgate_install_source to 'upload' and place the C-Gate zip in /share/cgate/"
         exit 1
     fi
 
@@ -104,6 +115,22 @@ else
     exit 1
 fi
 
+# The Schneider download is a zip-within-a-zip: the outer archive contains a
+# release notes PDF and an inner cgate-X.X.X_NNNN.zip with the actual files.
+# If cgate.jar is not yet visible, look for and extract any nested zip files.
+NESTED_JAR=$(find "${WORK_DIR}/extract" -name 'cgate.jar' -type f | head -1)
+if [[ -z "${NESTED_JAR}" ]]; then
+    bashio::log.info "cgate.jar not found at top level, checking for nested zip..."
+    NESTED_ZIP=$(find "${WORK_DIR}/extract" -name '*.zip' -type f | head -1)
+    if [[ -n "${NESTED_ZIP}" ]]; then
+        bashio::log.info "Extracting nested archive: $(basename "${NESTED_ZIP}")"
+        if ! unzip -o "${NESTED_ZIP}" -d "${WORK_DIR}/extract" 2>&1; then
+            bashio::log.error "Failed to extract nested zip: ${NESTED_ZIP}"
+            exit 1
+        fi
+    fi
+fi
+
 # Find and copy the C-Gate files to the persistent data directory
 EXTRACTED_JAR=$(find "${WORK_DIR}/extract" -name 'cgate.jar' -type f | head -1)
 if [[ -z "${EXTRACTED_JAR}" ]]; then
@@ -131,16 +158,36 @@ ACCESSEOF
     bashio::log.info "Created default access.txt"
 fi
 
-# Set the project name in C-Gate config
+# Set the project name and port configuration in C-Gate config
 CGATE_PROJECT=$(bashio::config 'cgate_project' 'HOME')
+CGATE_PORT=$(bashio::config 'cgate_port' '20023')
+CGATE_EVENT_PORT=$(bashio::config 'cgate_event_port' '20025')
 CGATE_CONFIG="${CGATE_DIR}/config/C-GateConfig.txt"
 if [[ -f "${CGATE_CONFIG}" ]]; then
+    # project.default
     if grep -q "project.default" "${CGATE_CONFIG}"; then
         sed -i "s/project.default=.*/project.default=${CGATE_PROJECT}/" "${CGATE_CONFIG}"
     else
         echo "project.default=${CGATE_PROJECT}" >> "${CGATE_CONFIG}"
     fi
+
+    # CommandInterface.port (command/program port)
+    if grep -q "CommandInterface.port" "${CGATE_CONFIG}"; then
+        sed -i "s/CommandInterface.port=.*/CommandInterface.port=${CGATE_PORT}/" "${CGATE_CONFIG}"
+    else
+        echo "CommandInterface.port=${CGATE_PORT}" >> "${CGATE_CONFIG}"
+    fi
+
+    # EventInterface.port (event/monitor port)
+    if grep -q "EventInterface.port" "${CGATE_CONFIG}"; then
+        sed -i "s/EventInterface.port=.*/EventInterface.port=${CGATE_EVENT_PORT}/" "${CGATE_CONFIG}"
+    else
+        echo "EventInterface.port=${CGATE_EVENT_PORT}" >> "${CGATE_CONFIG}"
+    fi
+
     bashio::log.info "Set default project to: ${CGATE_PROJECT}"
+    bashio::log.info "Set command port to: ${CGATE_PORT}"
+    bashio::log.info "Set event port to: ${CGATE_EVENT_PORT}"
 fi
 
 bashio::log.info "C-Gate installation complete"

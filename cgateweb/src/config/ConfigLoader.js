@@ -201,6 +201,14 @@ class ConfigLoader {
             }
         }
 
+        if (options.ha_bridge_diagnostics_enabled !== undefined && options.ha_bridge_diagnostics_enabled !== null) {
+            config.ha_bridge_diagnostics_enabled = options.ha_bridge_diagnostics_enabled === true;
+        }
+
+        if (options.ha_bridge_diagnostics_interval_sec !== undefined && options.ha_bridge_diagnostics_interval_sec !== null) {
+            config.ha_bridge_diagnostics_interval_sec = options.ha_bridge_diagnostics_interval_sec;
+        }
+
         // Label file: use explicit setting, or auto-detect from common addon paths
         if (options.cbus_label_file) {
             config.cbus_label_file = options.cbus_label_file;
@@ -218,6 +226,9 @@ class ConfigLoader {
         if (options.web_port) {
             config.web_port = options.web_port;
         }
+        // In addon mode the HA ingress proxy connects from outside the container's
+        // loopback interface, so the web server must bind to all interfaces.
+        config.web_bind_host = '0.0.0.0';
         if (options.web_api_key) {
             config.web_api_key = options.web_api_key;
         }
@@ -255,6 +266,10 @@ class ConfigLoader {
 
         if (typeof config.ha_discovery_enabled === 'string') {
             config.ha_discovery_enabled = config.ha_discovery_enabled.toLowerCase() === 'true';
+        }
+
+        if (typeof config.eventPublishCoalesce === 'string') {
+            config.eventPublishCoalesce = config.eventPublishCoalesce.toLowerCase() === 'true';
         }
 
         return config;
@@ -411,6 +426,22 @@ class ConfigLoader {
 
         if (configToValidate.messageinterval && (configToValidate.messageinterval < 10 || configToValidate.messageinterval > 10000)) {
             warnings.push('Message interval should be between 10 and 10000 milliseconds');
+        }
+
+        if (configToValidate.commandMinIntervalMs && (configToValidate.commandMinIntervalMs < 1 || configToValidate.commandMinIntervalMs > 1000)) {
+            warnings.push('commandMinIntervalMs should be between 1 and 1000 milliseconds');
+        }
+
+        if (configToValidate.eventPublishDedupWindowMs && (configToValidate.eventPublishDedupWindowMs < 0 || configToValidate.eventPublishDedupWindowMs > 60000)) {
+            warnings.push('eventPublishDedupWindowMs should be between 0 and 60000 milliseconds');
+        }
+
+        if (configToValidate.eventPublishDedupMaxEntries && configToValidate.eventPublishDedupMaxEntries < 100) {
+            warnings.push('eventPublishDedupMaxEntries should be at least 100');
+        }
+
+        if (configToValidate.topicCacheMaxEntries && configToValidate.topicCacheMaxEntries < 100) {
+            warnings.push('topicCacheMaxEntries should be at least 100');
         }
 
         // Validate C-Gate mode settings

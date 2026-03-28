@@ -38,13 +38,17 @@ class EventPublisher {
         this.eventPublishDedupWindowMs = Math.max(0, Number(this.settings.eventPublishDedupWindowMs) || 0);
         this.eventPublishDedupMaxEntries = Math.max(100, Number(this.settings.eventPublishDedupMaxEntries) || 5000);
         this.topicCacheMaxEntries = Math.max(100, Number(this.settings.topicCacheMaxEntries) || 5000);
+        this.eventPublishCoalesce = this.settings.eventPublishCoalesce === true;
         this._recentPublishes = new Map();
         this._topicCache = new Map();
+        this._coalesceBuffer = new Map();
+        this._coalesceTimer = null;
         this._publishStats = {
             publishAttempts: 0,
             published: 0,
             dedupDropped: 0,
             dedupEvicted: 0,
+            coalesced: 0,
             topicCacheHit: 0,
             topicCacheMiss: 0
         };
@@ -80,7 +84,7 @@ class EventPublisher {
         const topics = this._getTopicsForAddress(network, application, group);
         const isPirSensor = application === this.settings.ha_discovery_pir_app_id;
         const isCoverApp = application === this.settings.ha_discovery_cover_app_id;
-        const isCoverOverride = this._isTypeOverride(event, 'cover');
+        const isCoverOverride = this._isTypeOverride(network, application, group, 'cover');
         const isCover = isCoverApp || isCoverOverride;
         
         // Calculate level percentage for Home Assistant
@@ -137,16 +141,30 @@ class EventPublisher {
      * Checks whether the event's group has a type override matching the given type.
      * Falls back to false when no labelLoader is configured.
      */
-    _isTypeOverride(event, type) {
+    _isTypeOverride(network, application, group, type) {
         if (!this.labelLoader) return false;
         const typeOverrides = this.labelLoader.getTypeOverrides();
         if (!typeOverrides) return false;
-        const labelKey = `${event.getNetwork()}/${event.getApplication()}/${event.getGroup()}`;
+        const labelKey = `${network}/${application}/${group}`;
         return typeOverrides.get(labelKey) === type;
     }
 
     _publishIfNeeded(topic, payload, options) {
         this._publishStats.publishAttempts += 1;
+        if (this.eventPublishCoalesce) {
+            const hadExisting = this._coalesceBuffer.has(topic);
+            this._coalesceBuffer.set(topic, { payload, options });
+            if (hadExisting) {
+                this._publishStats.coalesced += 1;
+            }
+            this._scheduleCoalesceFlush();
+            return;
+        }
+
+        this._publishNow(topic, payload, options);
+    }
+
+    _publishNow(topic, payload, options) {
         if (!this.eventPublishDedupWindowMs) {
             this.publishFn(topic, payload, options);
             this._publishStats.published += 1;
@@ -164,6 +182,25 @@ class EventPublisher {
         this._pruneDedupCache(now);
         this.publishFn(topic, payload, options);
         this._publishStats.published += 1;
+    }
+
+    _scheduleCoalesceFlush() {
+        if (this._coalesceTimer) return;
+        this._coalesceTimer = setImmediate(() => {
+            this._coalesceTimer = null;
+            this._flushCoalesceBuffer();
+        });
+    }
+
+    _flushCoalesceBuffer() {
+        if (this._coalesceBuffer.size === 0) {
+            return;
+        }
+        const entries = [...this._coalesceBuffer.entries()];
+        this._coalesceBuffer.clear();
+        for (const [topic, value] of entries) {
+            this._publishNow(topic, value.payload, value.options);
+        }
     }
 
     _getTopicsForAddress(network, application, group) {
@@ -220,7 +257,9 @@ class EventPublisher {
             ...this._publishStats,
             dedupWindowMs: this.eventPublishDedupWindowMs,
             dedupCacheSize: this._recentPublishes.size,
-            topicCacheSize: this._topicCache.size
+            topicCacheSize: this._topicCache.size,
+            coalesceEnabled: this.eventPublishCoalesce,
+            coalesceBufferSize: this._coalesceBuffer.size
         };
     }
 }

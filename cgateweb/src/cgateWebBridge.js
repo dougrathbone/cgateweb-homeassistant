@@ -11,6 +11,7 @@ const CommandResponseProcessor = require('./commandResponseProcessor');
 const DeviceStateManager = require('./deviceStateManager');
 const LabelLoader = require('./labelLoader');
 const WebServer = require('./webServer');
+const HaBridgeDiagnostics = require('./haBridgeDiagnostics');
 const { createLogger } = require('./logger');
 const { LineProcessor } = require('./lineProcessor');
 
@@ -86,7 +87,11 @@ class CgateWebBridge {
         this.haDiscovery = null;
         
         // C-Gate command queue with throttling to avoid overwhelming serial protocol
-        const queueOptions = { maxSize: this.settings.maxQueueSize || 1000 };
+        const queueOptions = {
+            maxSize: this.settings.maxQueueSize || 1000,
+            getIntervalMs: () => this._getAdaptiveQueueIntervalMs(),
+            canProcessFn: () => this._canProcessCommandQueue()
+        };
         this.cgateCommandQueue = new ThrottledQueue(
             (command) => this._sendCgateCommand(command),
             this.settings.messageinterval,
@@ -162,6 +167,12 @@ class CgateWebBridge {
             maxMutationRequestsPerWindow: this.settings.web_mutation_rate_limit_per_minute || 120,
             getStatus: () => this._getBridgeStatus()
         });
+        this.haBridgeDiagnostics = new HaBridgeDiagnostics(
+            this.settings,
+            (topic, payload, options) => this.mqttManager.publish(topic, payload, options),
+            () => this._getBridgeStatus(),
+            this.logger
+        );
 
         this.initializationService = new BridgeInitializationService(this);
         this._setupEventHandlers();
@@ -236,6 +247,8 @@ class CgateWebBridge {
         
         // Start all connections via connection manager
         await this.connectionManager.start();
+        this.haBridgeDiagnostics.start();
+        this.haBridgeDiagnostics.publishNow('startup');
         this._updateBridgeReadiness('startup-complete');
         
         return this;
@@ -256,6 +269,7 @@ class CgateWebBridge {
         this._updateBridgeReadiness('shutdown');
         
         this.initializationService.stop();
+        this.haBridgeDiagnostics.stop();
 
         // Stop web server
         await this.webServer.close();
@@ -345,6 +359,27 @@ class CgateWebBridge {
         }
     }
 
+    _canProcessCommandQueue() {
+        const stats = this.commandConnectionPool?.getStats?.();
+        return !!(stats && stats.isStarted && !stats.isShuttingDown && stats.healthyConnections > 0);
+    }
+
+    _getAdaptiveQueueIntervalMs() {
+        const baseInterval = Math.max(10, Number(this.settings.messageinterval) || 200);
+        const minInterval = Math.max(5, Number(this.settings.commandMinIntervalMs) || 10);
+        const stats = this.commandConnectionPool?.getStats?.();
+        if (!stats || stats.healthyConnections <= 0) {
+            return baseInterval;
+        }
+
+        // Scale interval by writable healthy connections and queue pressure.
+        const writableConnections = Math.max(1, stats.writableConnections || stats.healthyConnections);
+        const queueDepth = this.cgateCommandQueue?.length || 0;
+        const depthMultiplier = queueDepth > (writableConnections * 20) ? 0.5 : 1;
+        const interval = Math.round((baseInterval / writableConnections) * depthMultiplier);
+        return Math.max(minInterval, interval);
+    }
+
     /**
      * Logs an informational message.
      * 
@@ -406,10 +441,9 @@ class CgateWebBridge {
             },
             metrics: {
                 commandQueue: {
-                    depth: this.cgateCommandQueue.length,
-                    dropped: this.cgateCommandQueue.droppedCount,
-                    maxSize: this.cgateCommandQueue.maxSize
-                }
+                    ...this.cgateCommandQueue.getStats()
+                },
+                publisher: this.eventPublisher?.getStats ? this.eventPublisher.getStats() : null
             },
             discovery: this.haDiscovery ? {
                 count: this.haDiscovery.discoveryCount,
@@ -433,6 +467,7 @@ class CgateWebBridge {
             this._setLifecycleState(this._hasEverBeenReady ? 'degraded' : 'booting', reason);
         }
         this.mqttManager.setBridgeReady(ready, reason);
+        this.haBridgeDiagnostics.publishNow(reason);
     }
 
     _setLifecycleState(state, reason) {
