@@ -45,6 +45,12 @@ configuration:
     description: Reject connections if the broker's TLS certificate cannot be
       verified. Keep enabled for security. Disable only if you are using a
       self-signed certificate without a CA file and understand the risks.
+  auto_discover_networks:
+    name: Auto-Discover C-Bus Networks
+    description: Automatically discover C-Bus network IDs from C-Gate on connect by
+      querying the project tree. When enabled, discovered networks are used for polling
+      and HA Discovery unless overridden by explicit network configuration. Disable if
+      auto-discovery causes issues or you want to restrict monitoring to specific networks.
   getall_networks:
     name: C-Bus Networks to Monitor
     description: List of C-Bus network IDs to poll for device states. The default
@@ -91,6 +97,11 @@ configuration:
     description: C-Bus application ID to treat as covers (blinds, shutters, garage
       doors). Common value is 203 (Enable Control). Leave empty to disable cover
       discovery.
+  ha_discovery_cover_tilt_app_id:
+    name: Cover Tilt Application ID
+    description: C-Bus application ID for venetian/louvre blind tilt angle control.
+      Groups in this application are paired by group number with covers in the Cover
+      Application. Leave empty to disable tilt control.
   ha_discovery_switch_app_id:
     name: Switch Application ID
     description: C-Bus application ID to treat as switches. Leave empty to disable
