@@ -211,6 +211,10 @@ class ConfigLoader {
             if (options.ha_discovery_switch_app_id) {
                 config.ha_discovery_switch_app_id = String(options.ha_discovery_switch_app_id);
             }
+
+            if (options.ha_discovery_trigger_app_id) {
+                config.ha_discovery_trigger_app_id = String(options.ha_discovery_trigger_app_id);
+            }
         }
 
         if (options.ha_bridge_diagnostics_enabled !== undefined && options.ha_bridge_diagnostics_enabled !== null) {
@@ -219,6 +223,17 @@ class ConfigLoader {
 
         if (options.ha_bridge_diagnostics_interval_sec !== undefined && options.ha_bridge_diagnostics_interval_sec !== null) {
             config.ha_bridge_diagnostics_interval_sec = options.ha_bridge_diagnostics_interval_sec;
+        }
+
+        // Connection pool settings (advanced)
+        if (options.connection_pool_size !== undefined) {
+            config.connectionPoolSize = options.connection_pool_size;
+        }
+        if (options.connection_health_check_interval_sec !== undefined) {
+            config.healthCheckInterval = options.connection_health_check_interval_sec * 1000;
+        }
+        if (options.connection_keep_alive_interval_sec !== undefined) {
+            config.keepAliveInterval = options.connection_keep_alive_interval_sec * 1000;
         }
 
         // Label file: use explicit setting, or auto-detect from common addon paths

@@ -1,5 +1,5 @@
 name: "C-Gate Web Bridge"
-version: "1.4.21"
+version: "1.4.22"
 slug: cgateweb
 description: "Bridge between Clipsal C-Bus systems and MQTT/Home Assistant"
 url: "https://github.com/dougrathbone/cgateweb"
@@ -75,6 +75,11 @@ options:
   ha_bridge_diagnostics_enabled: true
   ha_bridge_diagnostics_interval_sec: 60
 
+  # Connection pool settings (advanced)
+  connection_pool_size: 3
+  connection_health_check_interval_sec: 30
+  connection_keep_alive_interval_sec: 60
+
   # Label file for custom device names (auto-detected if not set)
   cbus_label_file: ""
   web_api_key: ""
@@ -126,8 +131,13 @@ schema:
   ha_discovery_networks: ["int(1,255)"]
   ha_discovery_cover_app_id: "int(1,255)?"
   ha_discovery_switch_app_id: "int(1,255)?"
+  ha_discovery_trigger_app_id: "int(1,255)?"
   ha_bridge_diagnostics_enabled: "bool"
   ha_bridge_diagnostics_interval_sec: "int(10,3600)?"
+  # Connection pool settings (advanced)
+  connection_pool_size: "int(1,10)?"
+  connection_health_check_interval_sec: "int(5,300)?"
+  connection_keep_alive_interval_sec: "int(10,600)?"
   cbus_label_file: "str?"
   web_api_key: "password?"
   web_allow_unauthenticated_mutations: "bool"
