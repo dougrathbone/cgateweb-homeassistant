@@ -12,6 +12,7 @@ const DeviceStateManager = require('./deviceStateManager');
 const LabelLoader = require('./labelLoader');
 const WebServer = require('./webServer');
 const HaBridgeDiagnostics = require('./haBridgeDiagnostics');
+const StaleDeviceDetector = require('./staleDeviceDetector');
 const { createLogger } = require('./logger');
 const { LineProcessor } = require('./lineProcessor');
 
@@ -138,6 +139,27 @@ class CgateWebBridge {
         this.labelLoader = new LabelLoader(this.settings.cbus_label_file || null);
         this.labelLoader.load();
 
+        // In-memory ring buffer and fan-out for live event log streaming (SSE)
+        const EVENT_LOG_MAX = 200;
+        this._eventLogBuffer = [];
+        this._eventLogListeners = new Set();
+        this._onEventLog = (entry) => {
+            this._eventLogBuffer.push(entry);
+            if (this._eventLogBuffer.length > EVENT_LOG_MAX) {
+                this._eventLogBuffer.shift();
+            }
+            for (const fn of this._eventLogListeners) {
+                try { fn(entry); } catch (e) { /* ignore listener errors */ void e; }
+            }
+        };
+
+        // eventStream interface for WebServer SSE endpoint
+        this.eventStream = {
+            subscribe: (fn) => { this._eventLogListeners.add(fn); },
+            unsubscribe: (fn) => { this._eventLogListeners.delete(fn); },
+            getRecent: () => [...this._eventLogBuffer]
+        };
+
         // Event publisher for MQTT messages -- publishes directly without throttling.
         // MQTT QoS 0 publishes are near-instant TCP buffer writes; the mqtt library
         // handles its own buffering and flow control.
@@ -147,7 +169,8 @@ class CgateWebBridge {
             mqttOptions: this._mqttOptions,
             labelLoader: this.labelLoader,
             logger: this.logger,
-            coverRampTracker: this.mqttCommandRouter.coverRampTracker
+            coverRampTracker: this.mqttCommandRouter.coverRampTracker,
+            onEventLog: this._onEventLog
         });
 
         // Command response processor for handling C-Gate command responses
@@ -170,7 +193,8 @@ class CgateWebBridge {
             allowedOrigins: this.settings.web_allowed_origins || null,
             maxMutationRequestsPerWindow: this.settings.web_mutation_rate_limit_per_minute || 120,
             triggerAppId: this.settings.ha_discovery_trigger_app_id || null,
-            getStatus: () => this._getBridgeStatus()
+            getStatus: () => this._getBridgeStatus(),
+            eventStream: this.eventStream
         });
         this.haBridgeDiagnostics = new HaBridgeDiagnostics(
             this.settings,
@@ -178,6 +202,13 @@ class CgateWebBridge {
             () => this._getBridgeStatus(),
             this.logger
         );
+        this.staleDeviceDetector = new StaleDeviceDetector({
+            deviceStateManager: this.deviceStateManager,
+            mqttClient: { publish: (topic, payload, opts) => this.mqttManager.publish(topic, payload, opts) },
+            settings: this.settings,
+            labelLoader: this.labelLoader,
+            logger: this.logger
+        });
 
         this.initializationService = new BridgeInitializationService(this);
         this._setupEventHandlers();
@@ -254,6 +285,7 @@ class CgateWebBridge {
         await this.connectionManager.start();
         this.haBridgeDiagnostics.start();
         this.haBridgeDiagnostics.publishNow('startup');
+        this.staleDeviceDetector.start();
         this._updateBridgeReadiness('startup-complete');
         
         return this;
@@ -275,6 +307,7 @@ class CgateWebBridge {
         
         this.initializationService.stop();
         this.haBridgeDiagnostics.stop();
+        this.staleDeviceDetector.stop();
 
         // Stop web server
         await this.webServer.close();
