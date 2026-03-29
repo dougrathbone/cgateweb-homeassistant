@@ -192,6 +192,14 @@ class ConfigLoader {
             config.getallperiod = options.getall_period;
         }
 
+        if (options.getall_app_periods && typeof options.getall_app_periods === 'object' && !Array.isArray(options.getall_app_periods)) {
+            const periods = {};
+            for (const [key, value] of Object.entries(options.getall_app_periods)) {
+                periods[String(key)] = value;
+            }
+            config.getall_app_periods = periods;
+        }
+
         if (options.retain_reads) {
             config.retainreads = true;
         }
@@ -260,6 +268,11 @@ class ConfigLoader {
         if (options.connection_keep_alive_interval_sec !== undefined) {
             config.keepAliveInterval = options.connection_keep_alive_interval_sec * 1000;
             config.eventConnectionKeepAliveInterval = options.connection_keep_alive_interval_sec * 1000;
+        }
+
+        // Cover ramp interpolation duration
+        if (options.cover_ramp_duration_sec !== undefined && options.cover_ramp_duration_sec !== null) {
+            config.cover_ramp_duration_ms = options.cover_ramp_duration_sec * 1000;
         }
 
         // Label file: use explicit setting, or auto-detect from common addon paths
