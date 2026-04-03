@@ -136,8 +136,19 @@ class CBusEvent {
                 ? this._rawEvent.slice(thirdSpace + 1)
                 : this._rawEvent.slice(thirdSpace + 1, fourthSpace);
             if (levelToken) {
-                this._levelRaw = this._extractLeadingInt(levelToken);
-                this._level = this._levelRaw;
+                if (this._isDigits(levelToken)) {
+                    this._levelRaw = parseInt(levelToken, 10);
+                    this._level = this._levelRaw;
+                } else {
+                    // Token is not a plain integer (e.g. UUID in 730 events);
+                    // look for a level=N key-value pair in the remainder.
+                    const levelIndex = this._rawEvent.indexOf('level=', thirdSpace + 1);
+                    if (levelIndex !== -1) {
+                        const levelPart = this._rawEvent.slice(levelIndex + 6);
+                        this._levelRaw = this._extractLeadingInt(levelPart);
+                        this._level = this._levelRaw;
+                    }
+                }
             }
         }
 
