@@ -91,7 +91,14 @@ class CgateWebBridge {
         const queueOptions = {
             maxSize: this.settings.maxQueueSize || 1000,
             getIntervalMs: () => this._getAdaptiveQueueIntervalMs(),
-            canProcessFn: () => this._canProcessCommandQueue()
+            canProcessFn: () => this._canProcessCommandQueue(),
+            onDrop: (droppedCount, priority, maxSize) => {
+                this.mqttManager.publish(
+                    'hello/cgateweb/warnings',
+                    `C-Gate command queue full (max ${maxSize}), ${droppedCount} command(s) dropped`,
+                    { retain: false }
+                );
+            }
         };
         this.cgateCommandQueue = new ThrottledQueue(
             (command) => this._sendCgateCommand(command),
@@ -194,6 +201,7 @@ class CgateWebBridge {
             maxMutationRequestsPerWindow: this.settings.web_mutation_rate_limit_per_minute || 120,
             triggerAppId: this.settings.ha_discovery_trigger_app_id || null,
             getStatus: () => this._getBridgeStatus(),
+            deviceStateManager: this.deviceStateManager,
             eventStream: this.eventStream
         });
         this.haBridgeDiagnostics = new HaBridgeDiagnostics(
@@ -211,6 +219,9 @@ class CgateWebBridge {
         });
 
         this.initializationService = new BridgeInitializationService(this);
+        this.commandResponseProcessor.onCommandError = (code, statusData) => {
+            this.initializationService.handleCommandError(code, statusData);
+        };
         this._setupEventHandlers();
     }
 
@@ -304,7 +315,14 @@ class CgateWebBridge {
         this.log(`Stopping cgateweb bridge...`);
         this._setLifecycleState('stopping', 'shutdown');
         this._updateBridgeReadiness('shutdown');
-        
+
+        // Remove all bridge-level event listeners before stopping subsystems
+        // to prevent callbacks firing into a partially-stopped bridge during teardown
+        this.connectionManager.removeAllListeners();
+        this.commandConnectionPool.removeAllListeners();
+        this.eventConnection.removeAllListeners();
+        this.mqttManager.removeAllListeners();
+
         this.initializationService.stop();
         this.haBridgeDiagnostics.stop();
         this.staleDeviceDetector.stop();
@@ -322,7 +340,10 @@ class CgateWebBridge {
         this.commandLineProcessors.clear();
         this.eventLineProcessor.close();
 
-        // Shut down device state manager
+        // Shut down event publisher, command router, and device state manager
+        this.eventPublisher.shutdown();
+        this.mqttCommandRouter.shutdown();
+        this.mqttCommandRouter.coverRampTracker.cancelAll();
         this.deviceStateManager.shutdown();
 
         // Disconnect all connections via connection manager
@@ -345,7 +366,11 @@ class CgateWebBridge {
             this.commandLineProcessors.set(key, processor);
         }
         processor.processData(data, (line) => {
-            this.commandResponseProcessor.processLine(line);
+            try {
+                this.commandResponseProcessor.processLine(line);
+            } catch (e) {
+                this.error(`Error processing command data line:`, e, `Line: ${line}`);
+            }
         });
     }
 
@@ -359,12 +384,12 @@ class CgateWebBridge {
 
     _processEventLine(line) {
         if (line.startsWith('#')) {
-            this.log(`Ignoring comment from event port:`, line);
+            this.logger.debug(`Ignoring comment from event port: ${line}`);
             return;
         }
 
         if (line.startsWith('clock ')) {
-            this.log(`Ignoring clock event from event port:`, line);
+            this.logger.debug(`Ignoring clock event from event port: ${line}`);
             return;
         }
 
@@ -516,6 +541,48 @@ class CgateWebBridge {
         this._lifecycle.state = state;
         this._lifecycle.reason = reason;
         this._lifecycle.since = Date.now();
+    }
+
+    // Hot-reloads settings that can be applied without reconnecting.
+    // Connection settings (mqtt host, cbus ip, ports) require a full restart.
+    reloadSettings(newSettings) {
+        const reloadableKeys = ['log_level', 'messageinterval', 'commandMinIntervalMs', 'getallperiod', 'getall_app_periods'];
+        const changed = reloadableKeys.filter(k => newSettings[k] !== this.settings[k]);
+
+        for (const k of reloadableKeys) {
+            this.settings[k] = newSettings[k];
+        }
+
+        if (newSettings.log_level) {
+            this._applyLogLevel(newSettings.log_level);
+        }
+
+        const getallNetworks = this.initializationService._resolveGetallNetworks();
+        if (getallNetworks.length > 0 && (this.settings.getallperiod || this.settings.getall_app_periods)) {
+            this.initializationService._scheduleAllGetalls(getallNetworks);
+        }
+
+        this.labelLoader.load();
+
+        if (changed.length > 0) {
+            this.logger.info(`Settings reloaded. Changed: ${changed.join(', ')}`);
+        } else {
+            this.logger.info('Settings reloaded (no changes detected)');
+        }
+    }
+
+    _applyLogLevel(level) {
+        [
+            this.logger,
+            this.mqttManager?.logger,
+            this.commandConnectionPool?.logger,
+            this.eventConnection?.logger,
+            this.commandResponseProcessor?.logger,
+            this.initializationService?.logger,
+            this.mqttCommandRouter?.logger,
+            this.eventPublisher?.logger,
+            this.connectionManager?.logger,
+        ].filter(Boolean).forEach(l => l.setLevel(level));
     }
 
     // Legacy method compatibility for tests

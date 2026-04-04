@@ -33,20 +33,6 @@ const {
     NEWLINE
 } = require('./constants');
 
-/**
- * Routes MQTT commands to appropriate C-Gate commands.
- * 
- * Handles the translation from MQTT topics/payloads to C-Gate protocol commands.
- * This router is responsible for:
- * - Parsing and validating MQTT commands
- * - Converting MQTT topics to C-Gate paths
- * - Managing device state for relative operations (increase/decrease)
- * - Queuing commands for transmission to C-Gate
- * 
- * @fires MqttCommandRouter#cgateCommand - When a C-Gate command should be sent
- * @fires MqttCommandRouter#haDiscoveryTrigger - When HA discovery should be triggered
- * @fires MqttCommandRouter#treeRequest - When device tree is requested for a network
- */
 class MqttCommandRouter extends EventEmitter {
     /**
      * Creates a new MQTT command router.
@@ -304,27 +290,28 @@ class MqttCommandRouter extends EventEmitter {
         // Cancel any existing pending operation for this address to prevent duplicate handlers
         this._cancelPendingRelativeLevel(levelAddress);
 
-        function cleanup() {
+        const cleanup = () => {
             this.internalEventEmitter.removeListener(MQTT_TOPIC_SUFFIX_LEVEL, levelHandler);
             this._pendingRelativeLevels.delete(levelAddress);
             clearTimeout(timeoutHandle);
-        }
+        };
 
         const levelHandler = (address, currentLevel) => {
             if (address === levelAddress) {
-                cleanup.call(this);
+                cleanup();
                 const newLevel = Math.max(CGATE_LEVEL_MIN, Math.min(limit, currentLevel + step));
                 this.logger.debug(`${actionName}: ${levelAddress} ${currentLevel} -> ${newLevel}`);
-                
+
                 const cgateCommand = `${CGATE_CMD_RAMP} ${cbusPath} ${newLevel}${NEWLINE}`;
                 this._queueCommand(cgateCommand);
             }
         };
 
+        const timeoutMs = this.settings.relativeLevelTimeoutMs || 5000;
         const timeoutHandle = setTimeout(() => {
-            cleanup.call(this);
+            cleanup();
             this.logger.warn(`Timeout waiting for level response from ${levelAddress} during ${actionName}`);
-        }, 5000).unref();
+        }, timeoutMs).unref();
 
         this._pendingRelativeLevels.set(levelAddress, { handler: levelHandler, timeoutHandle });
         this.internalEventEmitter.on(MQTT_TOPIC_SUFFIX_LEVEL, levelHandler);
@@ -347,6 +334,15 @@ class MqttCommandRouter extends EventEmitter {
             clearTimeout(pending.timeoutHandle);
             this._pendingRelativeLevels.delete(levelAddress);
             this.logger.debug(`Superseded pending relative level operation for ${levelAddress}`);
+        }
+    }
+
+    /**
+     * Cleans up pending relative level operations (timers and listeners).
+     */
+    shutdown() {
+        for (const [address] of this._pendingRelativeLevels) {
+            this._cancelPendingRelativeLevel(address);
         }
     }
 
@@ -608,19 +604,12 @@ class MqttCommandRouter extends EventEmitter {
         return `//${this.cbusname}/${command.getNetwork()}/${command.getApplication()}/${command.getGroup()}`;
     }
 
-    /**
-     * Queues a command for transmission to C-Gate.
-     * @param {string} command - The C-Gate command to queue
-     * @private
-     */
-    _queueCommand(command, priority = 'interactive') {
-        // Preserve historical behavior for omitted/empty priority while allowing
-        // explicit interactive commands to retain their priority in the queue.
-        if (arguments.length < 2 || !priority) {
+    _queueCommand(command, priority) {
+        if (priority) {
+            this.cgateCommandQueue.add(command, { priority });
+        } else {
             this.cgateCommandQueue.add(command);
-            return;
         }
-        this.cgateCommandQueue.add(command, { priority });
     }
 }
 

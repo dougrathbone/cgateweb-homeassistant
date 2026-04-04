@@ -43,7 +43,7 @@ const defaultSettings = {
     ha_discovery_enabled: false,
     ha_discovery_prefix: 'homeassistant',
     ha_discovery_networks: [],
-    ha_discovery_cover_app_id: '203',
+    ha_discovery_cover_app_id: null,
     cover_ramp_duration_ms: 5000,
     ha_discovery_cover_tilt_app_id: null,
     ha_discovery_switch_app_id: null,
@@ -64,7 +64,8 @@ const defaultSettings = {
     web_api_key: null,
     web_allow_unauthenticated_mutations: false,
     web_allowed_origins: null,
-    web_mutation_rate_limit_per_minute: 120
+    web_mutation_rate_limit_per_minute: 120,
+    relativeLevelTimeoutMs: 5000
 };
 
 module.exports = { defaultSettings };

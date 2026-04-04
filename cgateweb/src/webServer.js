@@ -47,6 +47,7 @@ class WebServer {
         this.eventStream = options.eventStream || null;
         this._sseKeepaliveMs = options._sseKeepaliveMs || 15000;
         this.getStatus = options.getStatus || (() => ({}));
+        this.deviceStateManager = options.deviceStateManager || null;
         this.apiKey = options.apiKey || null;
         this.allowUnauthenticatedMutations = options.allowUnauthenticatedMutations === true;
         this.allowedOrigins = Array.isArray(options.allowedOrigins)
@@ -145,6 +146,9 @@ class WebServer {
             }
             if (urlPath === '/api/status' && req.method === 'GET') {
                 return this._handleGetStatus(req, res);
+            }
+            if (urlPath === '/api/dashboard' && req.method === 'GET') {
+                return this._handleGetDashboard(req, res);
             }
             if (urlPath === '/healthz' && req.method === 'GET') {
                 return this._handleHealth(req, res);
@@ -365,6 +369,55 @@ class WebServer {
         });
     }
 
+    _handleGetDashboard(_req, res) {
+        const status = this.getStatus();
+        const labels = this.labelLoader.getLabelsObject();
+        const labelCount = Object.keys(labels).length;
+
+        // Build device list from device state manager
+        const devices = [];
+        if (this.deviceStateManager) {
+            const allLastSeen = this.deviceStateManager.getAllLastSeen();
+            const allLevels = this.deviceStateManager.getAllLevels
+                ? this.deviceStateManager.getAllLevels()
+                : new Map();
+            for (const [address, lastSeen] of allLastSeen) {
+                const level = allLevels.get(address);
+                devices.push({
+                    address,
+                    level: level !== undefined ? level : null,
+                    label: labels[address] || null,
+                    lastSeen
+                });
+            }
+            devices.sort((a, b) => b.lastSeen - a.lastSeen);
+        }
+
+        // Recent events from event stream
+        const recentEvents = this.eventStream
+            ? this.eventStream.getRecent().slice(-50)
+            : [];
+
+        this._sendJSON(res, 200, {
+            bridge: {
+                version: status.version,
+                uptime: status.uptime,
+                ready: status.ready,
+                lifecycle: status.lifecycle
+            },
+            connections: status.connections,
+            metrics: status.metrics,
+            discovery: status.discovery,
+            labels: { count: labelCount },
+            devices: {
+                total: devices.length,
+                active: devices.filter(d => d.lastSeen > Date.now() - 86400000).length,
+                list: devices.slice(0, 200)
+            },
+            recentEvents: recentEvents.length
+        });
+    }
+
     _handleHealth(_req, res) {
         const status = this.getStatus();
         this._sendJSON(res, 200, {
@@ -507,7 +560,10 @@ class WebServer {
         const windowStart = now - this.rateLimitWindowMs;
         this._pruneMutationRequestLog(windowStart);
         const inWindow = this._mutationRequestLog.get(source) || [];
-        inWindow.push(now);
+        // Cap array size to prevent memory exhaustion from rapid requests
+        if (inWindow.length <= this.maxMutationRequestsPerWindow * 2) {
+            inWindow.push(now);
+        }
         this._mutationRequestLog.set(source, inWindow);
         return inWindow.length > this.maxMutationRequestsPerWindow;
     }
@@ -527,37 +583,41 @@ class WebServer {
 
     _readBody(req) {
         return new Promise((resolve) => {
+            let resolved = false;
+            const done = (val) => { if (!resolved) { resolved = true; resolve(val); } };
             const chunks = [];
             let size = 0;
             req.on('data', (chunk) => {
                 size += chunk.length;
                 if (size > MAX_BODY_SIZE) {
                     req.destroy();
-                    resolve(null);
+                    done(null);
                     return;
                 }
                 chunks.push(chunk);
             });
-            req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
-            req.on('error', () => resolve(null));
+            req.on('end', () => done(Buffer.concat(chunks).toString('utf8')));
+            req.on('error', () => done(null));
         });
     }
 
     _readBodyRaw(req) {
         return new Promise((resolve) => {
+            let resolved = false;
+            const done = (val) => { if (!resolved) { resolved = true; resolve(val); } };
             const chunks = [];
             let size = 0;
             req.on('data', (chunk) => {
                 size += chunk.length;
                 if (size > MAX_BODY_SIZE) {
                     req.destroy();
-                    resolve(null);
+                    done(null);
                     return;
                 }
                 chunks.push(chunk);
             });
-            req.on('end', () => resolve(Buffer.concat(chunks)));
-            req.on('error', () => resolve(null));
+            req.on('end', () => done(Buffer.concat(chunks)));
+            req.on('error', () => done(null));
         });
     }
 
