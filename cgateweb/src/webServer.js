@@ -63,6 +63,8 @@ class WebServer {
                 : 120
         );
         this._mutationRequestLog = new Map();
+        this._haAreasCache = null;
+        this._haAreasCacheTime = 0;
         this.logger = createLogger({ component: 'WebServer' });
         this._server = null;
         this._parser = new CbusProjectParser();
@@ -113,6 +115,7 @@ class WebServer {
             }
 
             this._setCorsHeaders(req, res);
+            res.setHeader('X-Content-Type-Options', 'nosniff');
 
             if (req.method === 'OPTIONS') {
                 res.writeHead(204);
@@ -149,6 +152,9 @@ class WebServer {
             }
             if (urlPath === '/api/dashboard' && req.method === 'GET') {
                 return this._handleGetDashboard(req, res);
+            }
+            if (urlPath === '/api/areas' && req.method === 'GET') {
+                return await this._handleGetAreas(req, res);
             }
             if (urlPath === '/healthz' && req.method === 'GET') {
                 return this._handleHealth(req, res);
@@ -418,6 +424,83 @@ class WebServer {
         });
     }
 
+    async _handleGetAreas(_req, res) {
+        // Collect areas from label file
+        const labelAreas = new Set();
+        if (this.labelLoader) {
+            const areasMap = this.labelLoader.getLabelData?.()?.areas;
+            if (areasMap) {
+                const values = areasMap instanceof Map ? areasMap.values() : Object.values(areasMap);
+                for (const area of values) {
+                    if (area) labelAreas.add(area);
+                }
+            }
+        }
+
+        // Fetch areas from Home Assistant Supervisor API (cached 30s)
+        let haAreas = [];
+        const supervisorToken = process.env.SUPERVISOR_TOKEN;
+        if (supervisorToken) {
+            const now = Date.now();
+            if (this._haAreasCache && now - this._haAreasCacheTime < 30000) {
+                haAreas = this._haAreasCache;
+            } else {
+                try {
+                    const http = require('http');
+                    const data = await new Promise((resolve) => {
+                        const req = http.request('http://supervisor/core/api/config/area_registry/list', {
+                            method: 'POST',
+                            headers: {
+                                'Authorization': `Bearer ${supervisorToken}`,
+                                'Content-Type': 'application/json'
+                            },
+                            timeout: 5000
+                        }, (resp) => {
+                            let body = '';
+                            resp.on('data', (chunk) => { body += chunk; });
+                            resp.on('end', () => {
+                                try { resolve(JSON.parse(body)); } catch { resolve(null); }
+                            });
+                        });
+                        req.on('error', () => resolve(null));
+                        req.on('timeout', () => { req.destroy(); resolve(null); });
+                        req.end();
+                    });
+                    if (Array.isArray(data)) {
+                        for (const area of data) {
+                            if (area.name) haAreas.push({ id: area.area_id, name: area.name });
+                        }
+                        this._haAreasCache = haAreas;
+                        this._haAreasCacheTime = now;
+                    }
+                } catch {
+                    // HA API not available (standalone mode)
+                }
+            }
+        }
+
+        // Merge: HA areas + label-file areas, deduplicated by name (case-insensitive)
+        const seen = new Set();
+        const merged = [];
+        for (const ha of haAreas) {
+            const key = ha.name.toLowerCase();
+            if (!seen.has(key)) {
+                seen.add(key);
+                merged.push({ name: ha.name, source: 'homeassistant' });
+            }
+        }
+        for (const name of labelAreas) {
+            const key = name.toLowerCase();
+            if (!seen.has(key)) {
+                seen.add(key);
+                merged.push({ name, source: 'labels' });
+            }
+        }
+        merged.sort((a, b) => a.name.localeCompare(b.name));
+
+        this._sendJSON(res, 200, { areas: merged });
+    }
+
     _handleHealth(_req, res) {
         const status = this.getStatus();
         this._sendJSON(res, 200, {
@@ -537,25 +620,22 @@ class WebServer {
 
     _setCorsHeaders(req, res) {
         const requestOrigin = req.headers.origin;
-        let origin = null;
         if (this.allowedOrigins && this.allowedOrigins.length > 0) {
-            const isAllowed = requestOrigin && this.allowedOrigins.includes(requestOrigin);
-            origin = isAllowed ? requestOrigin : this.allowedOrigins[0];
             res.setHeader('Vary', 'Origin');
-        }
-        if (origin) {
-            res.setHeader('Access-Control-Allow-Origin', origin);
+            if (requestOrigin && this.allowedOrigins.includes(requestOrigin)) {
+                res.setHeader('Access-Control-Allow-Origin', requestOrigin);
+            }
+            // If origin is not in the allowlist, omit the header entirely —
+            // the browser will block the cross-origin request.
         }
         res.setHeader('Access-Control-Allow-Methods', 'GET, PUT, PATCH, POST, DELETE, OPTIONS');
         res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-API-Key');
     }
 
     _isRateLimited(req) {
-        const source = String(
-            req.headers['x-forwarded-for'] ||
-            req.socket?.remoteAddress ||
-            'unknown'
-        ).split(',')[0].trim();
+        // Use socket address for rate limiting — X-Forwarded-For is spoofable
+        // and would allow bypass by rotating the header value.
+        const source = String(req.socket?.remoteAddress || 'unknown');
         const now = Date.now();
         const windowStart = now - this.rateLimitWindowMs;
         this._pruneMutationRequestLog(windowStart);
