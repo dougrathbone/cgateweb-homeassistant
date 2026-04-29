@@ -71,6 +71,8 @@ const HA_COMPONENT_COVER = 'cover';
 const HA_COMPONENT_SWITCH = 'switch';
 const HA_COMPONENT_BUTTON = 'button';
 const HA_COMPONENT_CLIMATE = 'climate';
+const HA_COMPONENT_SENSOR = 'sensor';
+const HA_COMPONENT_BINARY_SENSOR = 'binary_sensor';
 const HA_DISCOVERY_SUFFIX = 'config';
 
 // HA Device Classes
@@ -94,6 +96,17 @@ const HA_COMPONENT_SCENE = 'scene';
 const HA_ORIGIN_NAME = 'cgateweb';
 const HA_ORIGIN_SW_VERSION = packageJson.version;
 const HA_ORIGIN_SUPPORT_URL = 'https://github.com/dougrathbone/cgateweb';
+
+// HA Discovery entity ID helpers
+function entityIdFields(component, objectId) {
+    return { default_entity_id: `${component}.${objectId}`, object_id: objectId };
+}
+
+// === File Paths ===
+// Default label-file path for Home Assistant add-on installs — /config is mounted
+// read-write and persists across updates.
+const DEFAULT_ADDON_LABEL_FILE = '/config/cgateweb-labels.json';
+const DEFAULT_ADDON_DATA_LABEL_FILE = '/data/labels.json';
 
 // === System ===
 const NEWLINE = '\n';
@@ -170,6 +183,8 @@ module.exports = {
     HA_COMPONENT_SWITCH,
     HA_COMPONENT_BUTTON,
     HA_COMPONENT_CLIMATE,
+    HA_COMPONENT_SENSOR,
+    HA_COMPONENT_BINARY_SENSOR,
     HA_DISCOVERY_SUFFIX,
     HA_DEVICE_CLASS_SHUTTER,
     HA_DEVICE_CLASS_OUTLET,
@@ -187,7 +202,12 @@ module.exports = {
     HA_ORIGIN_NAME,
     HA_ORIGIN_SW_VERSION,
     HA_ORIGIN_SUPPORT_URL,
-    
+    entityIdFields,
+
+    // File Paths
+    DEFAULT_ADDON_LABEL_FILE,
+    DEFAULT_ADDON_DATA_LABEL_FILE,
+
     // System
     NEWLINE,
     EVENT_REGEX,

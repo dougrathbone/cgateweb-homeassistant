@@ -1,5 +1,5 @@
 const { createLogger } = require('./logger');
-const { MQTT_TOPIC_STATUS } = require('./constants');
+const { MQTT_TOPIC_STATUS, entityIdFields, HA_COMPONENT_SENSOR, HA_DEVICE_VIA } = require('./constants');
 
 /**
  * Periodically checks for C-Bus devices that have not reported a state change
@@ -139,12 +139,11 @@ class StaleDeviceDetector {
      */
     _publishDiscovery() {
         const prefix = this.settings.ha_discovery_prefix || 'homeassistant';
-        const topic = `${prefix}/sensor/cgateweb_stale_devices/config`;
+        const topic = `${prefix}/${HA_COMPONENT_SENSOR}/cgateweb_stale_devices/config`;
         const payload = {
             name: 'C-Bus Stale Devices',
             unique_id: 'cgateweb_stale_devices',
-            default_entity_id: 'sensor.cgateweb_stale_devices',
-            object_id: 'cgateweb_stale_devices',
+            ...entityIdFields(HA_COMPONENT_SENSOR, 'cgateweb_stale_devices'),
             state_topic: 'cbus/bridge/stale_devices',
             json_attributes_topic: 'cbus/bridge/stale_devices_detail',
             unit_of_measurement: 'devices',
@@ -154,7 +153,7 @@ class StaleDeviceDetector {
             payload_available: 'Online',
             payload_not_available: 'Offline',
             device: {
-                identifiers: ['cgateweb_bridge'],
+                identifiers: [HA_DEVICE_VIA],
                 name: 'cgateweb Bridge',
                 manufacturer: 'Clipsal C-Bus via cgateweb',
                 model: 'Bridge Diagnostics'

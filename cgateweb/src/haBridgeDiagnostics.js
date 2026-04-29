@@ -1,6 +1,6 @@
 const fs = require('fs');
 const { createLogger } = require('./logger');
-const { MQTT_TOPIC_STATUS } = require('./constants');
+const { MQTT_TOPIC_STATUS, entityIdFields, HA_COMPONENT_SENSOR, HA_COMPONENT_BINARY_SENSOR, HA_DEVICE_VIA } = require('./constants');
 
 const CGATE_VERSION_FILE = '/data/cgate/.version';
 
@@ -56,14 +56,14 @@ class HaBridgeDiagnostics {
 
     _publishDiscovery() {
         const diagnostics = [
-            { key: 'ready', component: 'binary_sensor', name: 'Bridge Ready', icon: 'mdi:check-network-outline' },
-            { key: 'lifecycle_state', component: 'sensor', name: 'Bridge Lifecycle', icon: 'mdi:state-machine' },
-            { key: 'mqtt_connected', component: 'binary_sensor', name: 'MQTT Connected', icon: 'mdi:lan-connect' },
-            { key: 'event_connected', component: 'binary_sensor', name: 'Event Connection', icon: 'mdi:lan-connect' },
-            { key: 'command_pool_healthy', component: 'sensor', name: 'Healthy Command Connections', icon: 'mdi:pool' },
-            { key: 'command_queue_depth', component: 'sensor', name: 'Command Queue Depth', icon: 'mdi:queue-first-in-last-out' },
-            { key: 'reconnect_indicator', component: 'sensor', name: 'Reconnect Indicator', icon: 'mdi:restart-alert' },
-            { key: 'cgate_version', component: 'sensor', name: 'C-Gate Version', icon: 'mdi:tag-outline' }
+            { key: 'ready', component: HA_COMPONENT_BINARY_SENSOR, name: 'Bridge Ready', icon: 'mdi:check-network-outline' },
+            { key: 'lifecycle_state', component: HA_COMPONENT_SENSOR, name: 'Bridge Lifecycle', icon: 'mdi:state-machine' },
+            { key: 'mqtt_connected', component: HA_COMPONENT_BINARY_SENSOR, name: 'MQTT Connected', icon: 'mdi:lan-connect' },
+            { key: 'event_connected', component: HA_COMPONENT_BINARY_SENSOR, name: 'Event Connection', icon: 'mdi:lan-connect' },
+            { key: 'command_pool_healthy', component: HA_COMPONENT_SENSOR, name: 'Healthy Command Connections', icon: 'mdi:pool' },
+            { key: 'command_queue_depth', component: HA_COMPONENT_SENSOR, name: 'Command Queue Depth', icon: 'mdi:queue-first-in-last-out' },
+            { key: 'reconnect_indicator', component: HA_COMPONENT_SENSOR, name: 'Reconnect Indicator', icon: 'mdi:restart-alert' },
+            { key: 'cgate_version', component: HA_COMPONENT_SENSOR, name: 'C-Gate Version', icon: 'mdi:tag-outline' }
         ];
 
         for (const entity of diagnostics) {
@@ -72,20 +72,19 @@ class HaBridgeDiagnostics {
             const payload = {
                 name: entity.name,
                 unique_id: `cgateweb_bridge_${entity.key}`,
-                default_entity_id: `${entity.component}.cgateweb_bridge_${entity.key}`,
-                object_id: `cgateweb_bridge_${entity.key}`,
+                ...entityIdFields(entity.component, `cgateweb_bridge_${entity.key}`),
                 state_topic: stateTopic,
                 availability_topic: MQTT_TOPIC_STATUS,
                 payload_available: 'Online',
                 payload_not_available: 'Offline',
                 entity_category: 'diagnostic',
                 icon: entity.icon,
-                ...(entity.component === 'binary_sensor' && {
+                ...(entity.component === HA_COMPONENT_BINARY_SENSOR && {
                     payload_on: 'ON',
                     payload_off: 'OFF'
                 }),
                 device: {
-                    identifiers: ['cgateweb_bridge'],
+                    identifiers: [HA_DEVICE_VIA],
                     name: 'cgateweb Bridge',
                     manufacturer: 'Clipsal C-Bus via cgateweb',
                     model: 'Bridge Diagnostics'
