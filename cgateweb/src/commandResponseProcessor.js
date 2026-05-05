@@ -8,6 +8,11 @@ const {
     CGATE_RESPONSE_SYSTEM_EVENT
 } = require('./constants');
 
+// Strips C-Gate's leading async-event timestamp ("20260504-193110.569 ").
+const CGATE_TIMESTAMP_PREFIX = /^\d{8}-\d{6}\.\d+\s+/;
+// Extracts the numeric network id from a C-Gate object path "//PROJECT/254 ...".
+const CGATE_NETWORK_PATH = /\/\/[^/]+\/(\d+)\b/;
+
 /**
  * Handles processing of C-Gate command responses.
  * 
@@ -90,7 +95,7 @@ class CommandResponseProcessor {
         // Asynchronous notifications enabled by EVENT ON arrive on the command
         // port with this prefix; without stripping it the hyphen-first split
         // below would land in the date instead of the response code.
-        const stripped = (line || '').replace(/^\d{8}-\d{6}\.\d+\s+/, '');
+        const stripped = (line || '').replace(CGATE_TIMESTAMP_PREFIX, '');
 
         // C-Gate response codes are exactly 3 digits at the start of the line,
         // followed by either '-' (e.g. "200-OK") or ' ' (e.g. "742 //PROJECT
@@ -185,29 +190,37 @@ class CommandResponseProcessor {
 
     /**
      * Processes async system event lines (response code 742). C-Gate emits
-     * these for tag/network changes; the case we care about is "Network
-     * created", which signals that a configured network has finished loading
-     * and is now queryable via TREEXML. Forwarding to HaDiscovery lets us
-     * refresh discovery the moment a network becomes available, eliminating
-     * the startup race that the v1.8.1 retry mechanism otherwise covers.
+     * these for tag/network changes; we route two sub-types to HaDiscovery:
+     *
+     *   "Network created"  — a network has finished loading; refresh discovery
+     *                        immediately rather than waiting on the v1.8.1
+     *                        retry backoff.
+     *   "Network removed" / "Network deleted" — a network is gone; clear all
+     *                        retained HA Discovery config topics for it so the
+     *                        entities don't linger in HA forever.
      *
      * Example payload:
      *   "//12LESLIE/254 c2211b00-... Network created type=cni address=..."
      */
     _processSystemEvent(statusData) {
         const data = statusData || '';
-        if (!/Network created/.test(data)) {
+        const lifecycle = data.match(/Network (created|removed|deleted)/i);
+        if (!lifecycle) {
             this.logger.debug(`C-Gate system event 742 (no action): ${data}`);
             return;
         }
-        const match = data.match(/\/\/[^/]+\/(\d+)\b/);
-        if (!match) {
-            this.logger.debug(`C-Gate system event 742 (Network created, but no network id parsed): ${data}`);
+        const pathMatch = data.match(CGATE_NETWORK_PATH);
+        if (!pathMatch) {
+            this.logger.debug(`C-Gate system event 742 (${lifecycle[1]}, but no network id parsed): ${data}`);
             return;
         }
-        const networkId = match[1];
-        if (this._haDiscovery && typeof this._haDiscovery.handleNetworkCreated === 'function') {
+        if (!this._haDiscovery) return;
+
+        const networkId = pathMatch[1];
+        if (/created/i.test(lifecycle[1])) {
             this._haDiscovery.handleNetworkCreated(networkId);
+        } else {
+            this._haDiscovery.handleNetworkRemoved(networkId);
         }
     }
 

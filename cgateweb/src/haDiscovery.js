@@ -27,6 +27,7 @@ const {
     MQTT_COMMAND_STOP,
     MQTT_TOPIC_SUFFIX_DISCOVERY_STATUS,
     MQTT_TOPIC_STATUS,
+    MQTT_RETAINED_STATE_OPTIONS,
     HA_COMPONENT_LIGHT,
     HA_COMPONENT_BUTTON,
     HA_COMPONENT_CLIMATE,
@@ -88,12 +89,11 @@ class HaDiscovery {
         this._treeRetryMaxDelayMs = 60000;
         this._treeRequestTimeoutMs = 8000;
 
-        // Tracks per-network HA Discovery health. Each entry holds the last
-        // published state so we don't re-publish identical states. Networks for
-        // which we've published an HA Discovery config are tracked separately
-        // to avoid republishing the same config payload on every transition.
-        this._networkDiscoveryStatus = new Map();   // networkId -> 'discovering' | 'ok' | 'paused'
-        this._discoveryStatusConfigPublished = new Set();
+        // Tracks per-network HA Discovery health. The status field is used to
+        // de-dup repeated state publishes; configPublished gates the (one-shot)
+        // HA Discovery config payload so we don't republish it on every
+        // transition. networkId -> { status, configPublished }
+        this._networkDiscoveryEntities = new Map();
     }
 
     /**
@@ -189,6 +189,51 @@ class HaDiscovery {
         }
         this.logger.info(`Network ${networkKey} created in C-Gate; refreshing HA Discovery`);
         this.queueTreeRequest(networkKey);
+    }
+
+    /**
+     * Counterpart to handleNetworkCreated: when C-Gate signals that a network
+     * has been removed/deleted, clear all retained HA Discovery config topics
+     * for that network so the entities don't linger in HA forever. Empty
+     * retained payloads tell HA Discovery to delete the entity. Also cancels
+     * any in-flight TREEXML request and clears internal state for the network.
+     */
+    handleNetworkRemoved(networkId) {
+        if (!this.settings.ha_discovery_enabled) return;
+        const networkKey = String(networkId);
+
+        // Cancel any in-flight or pending discovery for this network.
+        this._clearTreeState(networkKey);
+        const pendingIdx = this.pendingTreeNetworks.indexOf(networkKey);
+        if (pendingIdx >= 0) this.pendingTreeNetworks.splice(pendingIdx, 1);
+
+        // Clear all entity discovery configs that we previously published for
+        // this network. HA Discovery convention: an empty retained payload on
+        // the config topic removes the entity.
+        const networkPrefix = `cgateweb_${networkKey}_`;
+        const topicsToRemove = [];
+        for (const topic of this._publishedTopics) {
+            if (topic.includes(`/${networkPrefix}`)) {
+                topicsToRemove.push(topic);
+            }
+        }
+        for (const topic of topicsToRemove) {
+            this._publish(topic, '', MQTT_RETAINED_STATE_OPTIONS);
+            this._publishedTopics.delete(topic);
+        }
+
+        // Remove the per-network discovery health diagnostic sensor itself.
+        const diagEntry = this._networkDiscoveryEntities.get(networkKey);
+        if (diagEntry && diagEntry.configPublished) {
+            const diagConfigTopic = `${this.settings.ha_discovery_prefix}/${HA_COMPONENT_SENSOR}/cgateweb_discovery_${networkKey}/${HA_DISCOVERY_SUFFIX}`;
+            this._publish(diagConfigTopic, '', MQTT_RETAINED_STATE_OPTIONS);
+        }
+        this._networkDiscoveryEntities.delete(networkKey);
+
+        this.logger.info(
+            `Network ${networkKey} removed from C-Gate; cleared ${topicsToRemove.length} entity ` +
+            `discovery topic(s)${diagEntry ? ' + diagnostic sensor' : ''}`
+        );
     }
 
     queueTreeRequest(networkId) {
@@ -303,12 +348,14 @@ class HaDiscovery {
     }
 
     /**
-     * Cancels all retry timers and watchdogs. Call on bridge shutdown.
+     * Cancels all retry timers and watchdogs and clears per-network state.
+     * Call on bridge shutdown.
      */
     stop() {
         for (const networkId of [...this._treeRequestState.keys()]) {
             this._clearTreeState(networkId);
         }
+        this._networkDiscoveryEntities.clear();
     }
 
     /**
@@ -316,10 +363,8 @@ class HaDiscovery {
      * via MQTT Discovery. Idempotent — only publishes the config payload once
      * per network for the lifetime of this instance.
      */
-    _publishDiscoveryStatusConfig(networkId) {
-        if (!this.settings.ha_discovery_enabled) return;
-        const networkKey = String(networkId);
-        if (this._discoveryStatusConfigPublished.has(networkKey)) return;
+    _publishDiscoveryStatusConfig(entry, networkKey) {
+        if (entry.configPublished) return;
 
         const uniqueId = `cgateweb_discovery_${networkKey}`;
         const stateTopic = `${MQTT_TOPIC_PREFIX_READ}/${networkKey}///${MQTT_TOPIC_SUFFIX_DISCOVERY_STATUS}`;
@@ -347,26 +392,34 @@ class HaDiscovery {
             }
         };
 
-        this._publish(configTopic, JSON.stringify(payload), { retain: true, qos: 0 });
-        this._discoveryStatusConfigPublished.add(networkKey);
+        this._publish(configTopic, JSON.stringify(payload), MQTT_RETAINED_STATE_OPTIONS);
+        entry.configPublished = true;
     }
 
     /**
      * Updates the per-network discovery status. Publishes the HA Discovery
      * config the first time a network is seen, then publishes the state to the
      * sensor's state topic. Skips republishes when the state hasn't changed.
+     *
+     * @param {string|number} networkId
+     * @param {('discovering'|'ok'|'paused')} status
      */
     _setDiscoveryStatus(networkId, status) {
         if (!this.settings.ha_discovery_enabled) return;
         const networkKey = String(networkId);
-        const previous = this._networkDiscoveryStatus.get(networkKey);
-        if (previous === status) return;
+        let entry = this._networkDiscoveryEntities.get(networkKey);
+        if (!entry) {
+            entry = { status: null, configPublished: false };
+            this._networkDiscoveryEntities.set(networkKey, entry);
+        }
+        if (entry.status === status) return;
 
-        this._publishDiscoveryStatusConfig(networkKey);
-        this._networkDiscoveryStatus.set(networkKey, status);
+        this._publishDiscoveryStatusConfig(entry, networkKey);
+        const previous = entry.status;
+        entry.status = status;
 
         const stateTopic = `${MQTT_TOPIC_PREFIX_READ}/${networkKey}///${MQTT_TOPIC_SUFFIX_DISCOVERY_STATUS}`;
-        this._publish(stateTopic, status, { retain: true, qos: 0 });
+        this._publish(stateTopic, status, MQTT_RETAINED_STATE_OPTIONS);
         this.logger.debug(`Discovery status for network ${networkKey}: ${previous || 'init'} -> ${status}`);
     }
 
@@ -451,7 +504,7 @@ class HaDiscovery {
                 this._publish(
                     `${MQTT_TOPIC_PREFIX_READ}/${networkForTree}///tree`,
                     JSON.stringify(result),
-                    { retain: true, qos: 0 }
+                    MQTT_RETAINED_STATE_OPTIONS
                 );
 
                 // Generate HA Discovery messages
@@ -534,7 +587,7 @@ class HaDiscovery {
         for (const topic of this._publishedTopics) {
             if (topic.includes(`/${networkUniqueIdPrefix}`) && !this._currentRunTopics.has(topic)) {
                 this.logger.debug(`Clearing stale discovery topic: ${topic}`);
-                this._publish(topic, '', { retain: true, qos: 0 });
+                this._publish(topic, '', MQTT_RETAINED_STATE_OPTIONS);
             }
         }
 
@@ -614,7 +667,7 @@ class HaDiscovery {
                     // (e.g. first run saw it as a light; this run sees the type override).
                     const uniqueId = `cgateweb_${networkId}_${appId}_${groupId}`;
                     const staleTopic = `${this.settings.ha_discovery_prefix}/${HA_COMPONENT_LIGHT}/${uniqueId}/${HA_DISCOVERY_SUFFIX}`;
-                    this._publish(staleTopic, '', { retain: true, qos: 0 });
+                    this._publish(staleTopic, '', MQTT_RETAINED_STATE_OPTIONS);
                     // Ensure the stale light topic is not retained in _publishedTopics
                     this._publishedTopics.delete(staleTopic);
                     return;
@@ -664,7 +717,7 @@ class HaDiscovery {
                 }
             };
 
-            this._publish(discoveryTopic, JSON.stringify(payload), { retain: true, qos: 0 });
+            this._publish(discoveryTopic, JSON.stringify(payload), MQTT_RETAINED_STATE_OPTIONS);
             if (this._currentRunTopics) this._currentRunTopics.add(discoveryTopic);
             this.discoveryCount++;
         });
@@ -789,7 +842,7 @@ class HaDiscovery {
             }
         };
 
-        this._publish(discoveryTopic, JSON.stringify(payload), { retain: true, qos: 0 });
+        this._publish(discoveryTopic, JSON.stringify(payload), MQTT_RETAINED_STATE_OPTIONS);
         this.discoveryCount++;
     }
 
@@ -858,7 +911,7 @@ class HaDiscovery {
             }
         };
 
-        this._publish(discoveryTopic, JSON.stringify(payload), { retain: true, qos: 0 });
+        this._publish(discoveryTopic, JSON.stringify(payload), MQTT_RETAINED_STATE_OPTIONS);
         if (this._currentRunTopics) this._currentRunTopics.add(discoveryTopic);
         this.discoveryCount++;
 
@@ -902,7 +955,7 @@ class HaDiscovery {
             }
         };
 
-        this._publish(discoveryTopic, JSON.stringify(payload), { retain: true, qos: 0 });
+        this._publish(discoveryTopic, JSON.stringify(payload), MQTT_RETAINED_STATE_OPTIONS);
         this.discoveryCount++;
     }
 
@@ -935,7 +988,7 @@ class HaDiscovery {
             }
         };
 
-        this._publish(discoveryTopic, JSON.stringify(payload), { retain: true, qos: 0 });
+        this._publish(discoveryTopic, JSON.stringify(payload), MQTT_RETAINED_STATE_OPTIONS);
         this.discoveryCount++;
     }
 
