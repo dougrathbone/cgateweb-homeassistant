@@ -158,8 +158,8 @@ Disable auto-discovery (`auto_discover_networks: false`) if:
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `web_api_key` | password | (empty) | API key required for write operations (`PUT/PATCH/POST`) on label-management endpoints. |
-| `web_allow_unauthenticated_mutations` | boolean | `false` | Unsafe override to allow write operations without API key authentication. |
+| `web_api_key` | password | (empty) | API key required for write operations (`PUT/PATCH/POST`) on label-management endpoints when accessed **directly** (not via Ingress). Requests through Home Assistant Ingress are already authenticated by HA and do not need this key. |
+| `web_allow_unauthenticated_mutations` | boolean | `false` | Unsafe override to allow write operations without authentication on the **directly-exposed** port. Not needed for the Ingress UI. |
 | `web_allowed_origins` | list | `[]` | Optional CORS allowlist of browser origins (e.g. `https://ha.example.com`). Empty disables cross-origin access. |
 | `web_mutation_rate_limit_per_minute` | integer | `120` | Per-client write rate limit for label mutation endpoints. |
 
@@ -174,6 +174,9 @@ Disable auto-discovery (`auto_discover_networks: false`) if:
 | `ha_discovery_switch_app_id` | integer | (null) | C-Bus app ID for switches (optional). Leave empty to disable switch discovery. |
 | `ha_discovery_trigger_app_id` | integer | (null) | C-Bus app ID for trigger groups (keypads, scene buttons). Typically `202`. Each group is exposed as an HA `event` entity, a companion `button` entity, and (when `ha_discovery_scene_enabled` is `true`) a `scene` entity. Leave empty to disable. |
 | `ha_discovery_scene_enabled` | boolean | `true` | Publish an HA `scene` entity for each C-Bus trigger group in addition to the `event` and `button` entities. Set to `false` to suppress scene entities. |
+| `ha_discovery_auto_type` | boolean | `true` | Auto-detect device types for Lighting-application (56) groups. Currently detects motorised covers (blinds/shutters) from the group label. A manual `type_overrides` entry and application-id mappings always take precedence; auto-detection only upgrades the default `light`. |
+| `ha_discovery_auto_type_name_heuristics` | boolean | `true` | When `ha_discovery_auto_type` is on, classify covers by matching the group label against the cover keyword list. Set to `false` to turn keyword matching off. |
+| `ha_discovery_auto_type_cover_keywords` | list | `[blind, shutter, shade, awning, curtain, roller, garage door]` | Keywords that mark a Lighting group as a cover. Matching is case-insensitive and catches plurals. |
 | `ha_discovery_hvac_app_id` | integer | (null) | C-Bus app ID for HVAC/climate zones. The standard C-Bus HVAC application is `201`. Each group is exposed as an HA `climate` entity. Leave empty to disable. |
 | `ha_hvac_temperature_unit` | list | `C` | Temperature unit for HVAC climate entities: `C` for Celsius, `F` for Fahrenheit. |
 | `ha_bridge_diagnostics_enabled` | boolean | `true` | Publish bridge health/diagnostic entities to Home Assistant via MQTT Discovery |
@@ -360,11 +363,11 @@ Set `ha_discovery_hvac_app_id: 201` to enable HVAC discovery. Use `ha_hvac_tempe
 
 This add-on runs with `host_network: false`.
 
-- Ingress is enabled and routes the label editor UI through Home Assistant.
+- Ingress is enabled and routes the label editor UI through Home Assistant. Requests arriving via Ingress are already authenticated by Home Assistant (the Supervisor injects an `X-Ingress-Path` header), so label edits and `.cbz`/XML imports work out of the box with no `web_api_key`.
 - Port `8080/tcp` is exposed by the add-on for direct access if needed.
 - Outbound connections to remote C-Gate and MQTT still work normally from the add-on container.
 
-If you expose `8080`, set `web_api_key` and keep `web_allow_unauthenticated_mutations: false`.
+If you expose `8080` for direct (non-Ingress) access, set `web_api_key` and keep `web_allow_unauthenticated_mutations: false`. Direct requests never carry the Ingress header, so they always require the key.
 
 ## Stale Device Detection
 
