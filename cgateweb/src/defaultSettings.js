@@ -61,6 +61,8 @@ const defaultSettings = {
         'blind', 'shutter', 'shade', 'awning', 'curtain', 'roller', 'garage door'
     ],
     ha_discovery_hvac_app_id: null,
+    // C-Bus Air Conditioning app ID for native temperature reads (e.g. 172); null disables.
+    cbus_aircon_app_id: null,
     ha_hvac_temperature_unit: 'C',
     ha_bridge_diagnostics_enabled: true,
     ha_bridge_diagnostics_interval_sec: 60,
@@ -88,7 +90,13 @@ const defaultSettings = {
     // Upper bound on DeviceStateManager's per-address level + last-seen maps.
     // Each entry is ~30 bytes; default 5000 covers any realistic install while
     // bounding worst-case growth from device churn over long uptime.
-    deviceStateMaxEntries: 5000
+    deviceStateMaxEntries: 5000,
+    // Apps whose raw C-Gate event lines should be logged verbatim (and published
+    // to cbus/read/{net}/{app}/{group}/raw) for protocol capture. Empty = off.
+    // Used to capture ground-truth samples for specialised applications
+    // (e.g. 25 Temperature, 228 Measurement, 172 Air Conditioning) before
+    // writing decoders. See docs/superpowers/specs/2026-06-02-native-cbus-hvac-support-design.md
+    cbusRawEventLogApps: []
 };
 
 module.exports = { defaultSettings };

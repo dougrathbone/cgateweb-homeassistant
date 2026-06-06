@@ -1,4 +1,5 @@
 const CgateConnection = require('./cgateConnection');
+const airconDecoder = require('./applicationDecoders/airconDecoder');
 const CgateConnectionPool = require('./cgateConnectionPool');
 const MqttManager = require('./mqttManager');
 const BridgeInitializationService = require('./bridgeInitializationService');
@@ -383,7 +384,33 @@ class CgateWebBridge {
         });
     }
 
+    /**
+     * Handles C-Bus Air Conditioning (app 172) event lines, which C-Gate renders
+     * as "[# ]aircon <verb> //PROJECT/<net>/<app> <params>" — a shape the standard
+     * event parser can't handle (no group; often #-comment-prefixed). Gated behind
+     * settings.cbus_aircon_app_id; when unset, returns false so these lines fall
+     * through to the normal (comment-dropping) path, preserving current behaviour.
+     * Returns true when the line was an aircon line and was consumed here.
+     */
+    _handleAirconLine(line) {
+        const appId = this.settings.cbus_aircon_app_id;
+        if (!appId) return false;
+        let s = line.trim();
+        if (s.startsWith('#')) s = s.slice(1).trim();
+        if (!s.startsWith('aircon ')) return false;
+        // Aircon traffic and the feature is enabled — consume it here.
+        const reading = airconDecoder.decodeLine(line);
+        if (reading && reading.kind === 'temperature' && reading.application === String(appId)) {
+            this.eventPublisher.publishReading(reading.network, reading.application, reading.zoneGroup, reading);
+        } else if (this.logger.isLevelEnabled && this.logger.isLevelEnabled('debug')) {
+            this.logger.debug(`Aircon line not natively decoded (verb pending support): ${line}`);
+        }
+        return true;
+    }
+
     _processEventLine(line) {
+        if (this._handleAirconLine(line)) return;
+
         if (line.startsWith('#')) {
             this.logger.debug(`Ignoring comment from event port: ${line}`);
             return;
@@ -393,6 +420,8 @@ class CgateWebBridge {
             this.logger.debug(`Ignoring clock event from event port: ${line}`);
             return;
         }
+
+        this._publishRawEventCapture(line);
 
         if (this.logger.isLevelEnabled && this.logger.isLevelEnabled('debug')) {
             this.logger.debug(`C-Gate Recv (Evt): ${line}`);
@@ -412,6 +441,37 @@ class CgateWebBridge {
     }
 
 
+
+    /**
+     * If the event's application is listed in settings.cbusRawEventLogApps, log
+     * the verbatim line and publish it to cbus/read/{net}/{app}/{group}/raw for
+     * protocol capture. Cheap, allocation-light app extraction so it can safely
+     * run on every event line (including ones the standard parser can't decode).
+     */
+    _publishRawEventCapture(line) {
+        const apps = this.settings.cbusRawEventLogApps;
+        if (!apps || apps.length === 0) return;
+
+        // Extract the first network/application/group token; application is field 2.
+        // Assumes the address is the first numeric triple on the line, which holds
+        // for every known C-Gate event/status shape (e.g. "lighting on 254/56/4",
+        // "//CLIPSAL/254/56/10", "300 //HOME/254/203/5: level=128").
+        const match = line.match(/(\d+)\/(\d+)\/(\d+)/);
+        if (!match) return;
+        const application = match[2];
+        if (!apps.some(a => String(a) === application)) return;
+
+        this.logger.info(`C-Gate raw capture [app ${application}]: ${line}`);
+        try {
+            this.mqttManager.publish(
+                `cbus/read/${match[1]}/${match[2]}/${match[3]}/raw`,
+                line,
+                { retain: false, qos: 0 }
+            );
+        } catch (e) {
+            this.logger.debug(`Raw capture publish failed: ${e.message}`);
+        }
+    }
 
     // Event publishing now delegated to EventPublisher
 
