@@ -1,5 +1,5 @@
 name: "C-Gate Web Bridge"
-version: "1.13.0"
+version: "1.13.1"
 slug: cgateweb
 description: "Bridge between Clipsal C-Bus systems and MQTT/Home Assistant"
 url: "https://github.com/dougrathbone/cgateweb"
@@ -122,6 +122,9 @@ schema:
   stale_device_detection_enabled: "bool?"
   stale_device_threshold_hours: "int(1,720)?"
   stale_device_check_interval_sec: "int(60,86400)?"
+
+  # ── C-Bus Network (CNI) Monitoring ──
+  cni_offline_notification: "bool?"
 
   # ── Advanced: Connection Pool ──
   connection_pool_size: "int(1,10)?"
