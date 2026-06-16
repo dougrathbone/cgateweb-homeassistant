@@ -1,5 +1,4 @@
 const CgateConnection = require('./cgateConnection');
-const airconDecoder = require('./applicationDecoders/airconDecoder');
 const CgateConnectionPool = require('./cgateConnectionPool');
 const MqttManager = require('./mqttManager');
 const BridgeInitializationService = require('./bridgeInitializationService');
@@ -8,6 +7,7 @@ const CBusEvent = require('./cbusEvent');
 const MqttCommandRouter = require('./mqttCommandRouter');
 const ConnectionManager = require('./connectionManager');
 const EventPublisher = require('./eventPublisher');
+const AirconEventHandler = require('./airconEventHandler');
 const CommandResponseProcessor = require('./commandResponseProcessor');
 const DeviceStateManager = require('./deviceStateManager');
 const LabelLoader = require('./labelLoader');
@@ -16,10 +16,11 @@ const HaBridgeDiagnostics = require('./haBridgeDiagnostics');
 const StaleDeviceDetector = require('./staleDeviceDetector');
 const { NetworkInterfaceMonitor } = require('./networkInterfaceMonitor');
 const { AirconControlRegistry } = require('./airconControlRegistry');
-const haNotifier = require('./haNotifier');
+const CniNotificationManager = require('./cniNotificationManager');
+const BridgeReadiness = require('./bridgeReadiness');
 const { createLogger } = require('./logger');
 const { LineProcessor } = require('./lineProcessor');
-const { MQTT_RETAINED_STATE_OPTIONS, MQTT_TOPIC_PREFIX_READ, MQTT_STATE_ON, MQTT_STATE_OFF } = require('./constants');
+const { MQTT_RETAINED_STATE_OPTIONS } = require('./constants');
 const { clampSetting } = require('./utils');
 
 /**
@@ -71,7 +72,64 @@ class CgateWebBridge {
         this.mqttClientFactory = mqttClientFactory;
         this.commandSocketFactory = commandSocketFactory;
         this.eventSocketFactory = eventSocketFactory;
-        
+
+        // Single late-binding accessor for haDiscovery, which is null at
+        // construction and assigned during init. Shared by the collaborators and
+        // the init service so they all read the live value, not a captured null.
+        this._getHaDiscovery = () => this.haDiscovery;
+
+        // Construct all subsystems in dependency order. _buildSubsystems invokes
+        // _buildQueues and _buildEventLogBuffer inline at the exact points they
+        // are needed, so construction order is identical to the original
+        // inline constructor.
+        this._buildSubsystems();
+
+        // Drive the side effects of a readiness change: publish the bridge's
+        // online/offline status (hello/cgateweb via mqttManager) and refresh the
+        // HA bridge diagnostics. Fires on every update() so behaviour matches the
+        // original _updateBridgeReadiness, which always invoked both.
+        this.bridgeReadiness.on('readinessChanged', ({ ready, reason }) => {
+            this.mqttManager.setBridgeReady(ready, reason);
+            this.haBridgeDiagnostics.publishNow(reason);
+        });
+
+        // The init service computes and returns an InitResult instead of
+        // mutating the bridge directly. State the bridge owns and exposes to
+        // other collaborators (haDiscovery, discoveredNetworks) is read back
+        // through getters and written back through the apply* setters at the
+        // exact point in the init flow it changes, preserving the timing the
+        // bridge's live accessors depend on (e.g. getHaDiscovery for aircon/CNI).
+        this.initializationService = new BridgeInitializationService({
+            settings: this.settings,
+            commandQueue: this.cgateCommandQueue,
+            mqttManager: this.mqttManager,
+            labelLoader: this.labelLoader,
+            log: (message) => this.log(message),
+            getCommandResponseProcessor: () => this.commandResponseProcessor,
+            getDiscoveredNetworks: () => this.discoveredNetworks,
+            getHaDiscovery: this._getHaDiscovery,
+            applyDiscoveredNetworks: (networks) => { this.discoveredNetworks = networks; },
+            applyHaDiscovery: (haDiscovery) => {
+                this.haDiscovery = haDiscovery;
+                this.commandResponseProcessor.haDiscovery = haDiscovery;
+            },
+            updateReadiness: (reason) => this._updateBridgeReadiness(reason)
+        });
+        this.commandResponseProcessor.onCommandError = (code, statusData) => {
+            this.initializationService.handleCommandError(code, statusData);
+        };
+        this._setupEventHandlers();
+    }
+
+    /**
+     * Builds all bridge subsystems in dependency order (managers, connection
+     * pool, event connection, publisher, registries, web server, diagnostics,
+     * and the extracted collaborators). Invokes _buildQueues and
+     * _buildEventLogBuffer inline at the exact positions they ran in the
+     * original constructor so initialization order is preserved.
+     * @private
+     */
+    _buildSubsystems() {
         // Connection managers
         this.mqttManager = new MqttManager(this.settings);
         
@@ -92,26 +150,9 @@ class CgateWebBridge {
         
         // Service modules (haDiscovery will be initialized after pool starts)
         this.haDiscovery = null;
-        
+
         // C-Gate command queue with throttling to avoid overwhelming serial protocol
-        const queueOptions = {
-            maxSize: this.settings.maxQueueSize || 1000,
-            getIntervalMs: () => this._getAdaptiveQueueIntervalMs(),
-            canProcessFn: () => this._canProcessCommandQueue(),
-            onDrop: (droppedCount, priority, maxSize) => {
-                this.mqttManager.publish(
-                    'hello/cgateweb/warnings',
-                    `C-Gate command queue full (max ${maxSize}), ${droppedCount} command(s) dropped`,
-                    { retain: false }
-                );
-            }
-        };
-        this.cgateCommandQueue = new ThrottledQueue(
-            (command) => this._sendCgateCommand(command),
-            this.settings.messageinterval,
-            'C-Gate Command Queue',
-            queueOptions
-        );
+        this._buildQueues();
 
         // Device state manager for coordinating device state between components
         this.deviceStateManager = new DeviceStateManager({
@@ -139,15 +180,14 @@ class CgateWebBridge {
         // don't corrupt lines being assembled on another.
         this.commandLineProcessors = new Map();
         this.eventLineProcessor = new LineProcessor();
-        this.periodicGetAllInterval = null;
-        this._lastInitTime = 0;
-        this._hasEverBeenReady = false;
-        this._lifecycle = {
-            state: 'booting',
-            reason: 'startup',
-            since: Date.now(),
-            transitions: 0
-        };
+        // Networks discovered by the init service (via auto-discovery). Read live
+        // by the init service and by _resolveGetallNetworks; starts unset.
+        this.discoveredNetworks = null;
+
+        // Owns lifecycle state + readiness reason; emits 'readinessChanged' which
+        // the bridge subscribes to (after haBridgeDiagnostics is built) to drive
+        // the hello/cgateweb status publish and diagnostics refresh.
+        this.bridgeReadiness = new BridgeReadiness();
 
         // MQTT options
         this._mqttOptions = this.settings.retainreads ? MQTT_RETAINED_STATE_OPTIONS : { qos: 0 };
@@ -157,25 +197,7 @@ class CgateWebBridge {
         this.labelLoader.load();
 
         // In-memory ring buffer and fan-out for live event log streaming (SSE)
-        const EVENT_LOG_MAX = 200;
-        this._eventLogBuffer = [];
-        this._eventLogListeners = new Set();
-        this._onEventLog = (entry) => {
-            this._eventLogBuffer.push(entry);
-            if (this._eventLogBuffer.length > EVENT_LOG_MAX) {
-                this._eventLogBuffer.shift();
-            }
-            for (const fn of this._eventLogListeners) {
-                try { fn(entry); } catch (e) { this.logger.debug('Event-log listener threw', { error: e }); }
-            }
-        };
-
-        // eventStream interface for WebServer SSE endpoint
-        this.eventStream = {
-            subscribe: (fn) => { this._eventLogListeners.add(fn); },
-            unsubscribe: (fn) => { this._eventLogListeners.delete(fn); },
-            getRecent: () => [...this._eventLogBuffer]
-        };
+        this._buildEventLogBuffer();
 
         // Event publisher for MQTT messages -- publishes directly without throttling.
         // MQTT QoS 0 publishes are near-instant TCP buffer writes; the mqtt library
@@ -190,8 +212,29 @@ class CgateWebBridge {
             onEventLog: this._onEventLog
         });
 
+        // Decodes native-aircon (app 172) event lines, records control state, and
+        // publishes readings. haDiscovery is read live as it's initialized later.
+        this.airconEventHandler = new AirconEventHandler({
+            registry: this.airconControlRegistry,
+            eventPublisher: this.eventPublisher,
+            logger: this.logger,
+            settings: this.settings,
+            getHaDiscovery: this._getHaDiscovery
+        });
+
         // Tracks CNI/PCI connectivity per C-Bus network (see networkInterfaceMonitor).
         this.networkInterfaceMonitor = new NetworkInterfaceMonitor({ logger: this.logger });
+
+        // CNI online/offline state machine: publishes connectivity state and
+        // raises/dismisses HA persistent notifications on transitions.
+        this.cniNotificationManager = new CniNotificationManager({
+            networkInterfaceMonitor: this.networkInterfaceMonitor,
+            mqttManager: this.mqttManager,
+            getHaDiscovery: this._getHaDiscovery,
+            logger: this.logger,
+            settings: this.settings,
+            mqttOptions: this._mqttOptions
+        });
 
         // Command response processor for handling C-Gate command responses
         this.commandResponseProcessor = new CommandResponseProcessor({
@@ -235,12 +278,62 @@ class CgateWebBridge {
             labelLoader: this.labelLoader,
             logger: this.logger
         });
+    }
 
-        this.initializationService = new BridgeInitializationService(this);
-        this.commandResponseProcessor.onCommandError = (code, statusData) => {
-            this.initializationService.handleCommandError(code, statusData);
+    /**
+     * Builds the throttled C-Gate command queue. Depends on mqttManager (for the
+     * onDrop warning publish) and on the _getAdaptiveQueueIntervalMs /
+     * _canProcessCommandQueue methods (available as instance methods).
+     * @private
+     */
+    _buildQueues() {
+        // C-Gate command queue with throttling to avoid overwhelming serial protocol
+        const queueOptions = {
+            maxSize: this.settings.maxQueueSize || 1000,
+            getIntervalMs: () => this._getAdaptiveQueueIntervalMs(),
+            canProcessFn: () => this._canProcessCommandQueue(),
+            onDrop: (droppedCount, priority, maxSize) => {
+                this.mqttManager.publish(
+                    'hello/cgateweb/warnings',
+                    `C-Gate command queue full (max ${maxSize}), ${droppedCount} command(s) dropped`,
+                    { retain: false }
+                );
+            }
         };
-        this._setupEventHandlers();
+        this.cgateCommandQueue = new ThrottledQueue(
+            (command) => this._sendCgateCommand(command),
+            this.settings.messageinterval,
+            'C-Gate Command Queue',
+            queueOptions
+        );
+    }
+
+    /**
+     * Sets up the in-memory ring buffer and fan-out used for live event log
+     * streaming (SSE). Establishes _eventLogBuffer, _eventLogListeners,
+     * _onEventLog and the eventStream interface consumed by the web server.
+     * @private
+     */
+    _buildEventLogBuffer() {
+        const EVENT_LOG_MAX = 200;
+        this._eventLogBuffer = [];
+        this._eventLogListeners = new Set();
+        this._onEventLog = (entry) => {
+            this._eventLogBuffer.push(entry);
+            if (this._eventLogBuffer.length > EVENT_LOG_MAX) {
+                this._eventLogBuffer.shift();
+            }
+            for (const fn of this._eventLogListeners) {
+                try { fn(entry); } catch (e) { this.logger.debug('Event-log listener threw', { error: e }); }
+            }
+        };
+
+        // eventStream interface for WebServer SSE endpoint
+        this.eventStream = {
+            subscribe: (fn) => { this._eventLogListeners.add(fn); },
+            unsubscribe: (fn) => { this._eventLogListeners.delete(fn); },
+            getRecent: () => [...this._eventLogBuffer]
+        };
     }
 
     _setupEventHandlers() {
@@ -367,7 +460,13 @@ class CgateWebBridge {
     }
 
     _handleAllConnected() {
-        this.initializationService.handleAllConnected();
+        // The init service applies the bridge-owned state (haDiscovery,
+        // discoveredNetworks) in-flight through the apply* setters wired in the
+        // constructor, so the bridge's live accessors observe it at the same
+        // moment as before. The returned InitResult is the explicit contract
+        // (used by tests and any awaiting caller); production fires this without
+        // awaiting, exactly as before.
+        return this.initializationService.handleAllConnected();
     }
 
     // MQTT message handling now delegated to MqttCommandRouter
@@ -399,48 +498,11 @@ class CgateWebBridge {
     }
 
     /**
-     * Handles C-Bus Air Conditioning (app 172) event lines, which C-Gate renders
-     * as "[# ]aircon <verb> //PROJECT/<net>/<app> <params>" — a shape the standard
-     * event parser can't handle (no group; often #-comment-prefixed). Gated behind
-     * settings.cbus_aircon_app_id; when unset, returns false so these lines fall
-     * through to the normal (comment-dropping) path, preserving current behaviour.
-     * Returns true when the line was an aircon line and was consumed here.
+     * Delegates native-aircon (app 172) event-line handling to AirconEventHandler.
+     * Returns true when the line was an aircon line and was consumed there.
      */
     _handleAirconLine(line) {
-        const appId = this.settings.cbus_aircon_app_id;
-        if (!appId) return false;
-        let s = line.trim();
-        if (s.startsWith('#')) s = s.slice(1).trim();
-        if (!s.startsWith('aircon ')) return false;
-        // Aircon traffic and the feature is enabled — consume it here.
-        const reading = airconDecoder.decodeLine(line);
-        if (reading && reading.application === String(appId)) {
-            const group = reading.sourceUnit || reading.zoneGroup;
-            if (reading.kind === 'temperature' || reading.kind === 'mode' || reading.kind === 'state' || reading.kind === 'action') {
-                this.eventPublisher.publishReading(reading.network, reading.application, group, reading);
-            }
-            // Remember ward/zones/type so HA can control this thermostat (writes
-            // target ward+zone-list, not the source unit). See airconControlRegistry.
-            if (reading.kind === 'mode') {
-                this.airconControlRegistry.recordModeReading(reading);
-            }
-            // Event-driven HA discovery: announce the thermostat (keyed by source unit)
-            // the first time we see it. ensureNativeAirconDiscovery is idempotent and
-            // gated on ha_discovery_enabled internally.
-            if (this.haDiscovery && reading.sourceUnit) {
-                this.haDiscovery.ensureNativeAirconDiscovery(reading.network, reading.application, reading.sourceUnit);
-            }
-            if (reading.kind === 'mode' && reading.mode === null) {
-                this.logger.warn(
-                    'Unmapped C-Bus HVAC mode code ' + reading.modeRaw +
-                    ' on unit ' + reading.sourceUnit +
-                    ' — please report. Line: ' + line
-                );
-            }
-        } else if (this.logger.isLevelEnabled && this.logger.isLevelEnabled('debug')) {
-            this.logger.debug(`Aircon line not natively decoded (verb pending support): ${line}`);
-        }
-        return true;
+        return this.airconEventHandler.handleLine(line);
     }
 
     _processEventLine(line) {
@@ -460,6 +522,15 @@ class CgateWebBridge {
 
         if (this.logger.isLevelEnabled && this.logger.isLevelEnabled('debug')) {
             this.logger.debug(`C-Gate Recv (Evt): ${line}`);
+        }
+
+        // Aircon-format lines that weren't consumed above (feature disabled, an
+        // unsupported verb, or a different app) are surfaced in raw capture but
+        // are never valid CBusEvents — skip the parse so they don't spam a
+        // "Could not parse event line" warning on every broadcast.
+        if (this.airconEventHandler.isAirconLine(line)) {
+            this.logger.debug(`Unparsed aircon line (captured, not a standard event): ${line}`);
+            return;
         }
 
         try {
@@ -570,64 +641,13 @@ class CgateWebBridge {
     }
 
     /**
-     * Handle a network InterfaceState/State reading: track it, publish the
-     * retained connectivity state for the binary_sensor, ensure the discovery
-     * entity exists, and (optionally) raise/clear an HA notification on
-     * transitions.
+     * Handle a network InterfaceState/State reading. Delegates to the CNI
+     * notification manager, which tracks it, publishes the retained connectivity
+     * state for the binary_sensor, ensures the discovery entity exists, and
+     * (optionally) raises/clears an HA notification on transitions.
      */
     _handleNetworkInterfaceReading(networkId, reading) {
-        const result = this.networkInterfaceMonitor.update(networkId, reading);
-
-        // Keep the connectivity binary_sensor's discovery config present (idempotent).
-        if (this.haDiscovery) {
-            this.haDiscovery.ensureNetworkConnectivityDiscovery(networkId);
-        }
-
-        if (result.changed && result.online !== null) {
-            this.mqttManager.publish(
-                `${MQTT_TOPIC_PREFIX_READ}/${networkId}/cni/state`,
-                result.online ? MQTT_STATE_ON : MQTT_STATE_OFF,
-                { ...this._mqttOptions, retain: true }
-            );
-
-            if (this.settings.cni_offline_notification) {
-                if (result.online === false) {
-                    this._notifyCniOffline(networkId, result.interfaceState);
-                } else {
-                    this._dismissCniNotification(networkId);
-                }
-            }
-        }
-    }
-
-    _notifyCniOffline(networkId, interfaceState) {
-        const token = process.env.SUPERVISOR_TOKEN;
-        if (!token) {
-            this.logger.debug('cni_offline_notification enabled but no SUPERVISOR_TOKEN available; skipping HA notification.');
-            return;
-        }
-        haNotifier.createPersistentNotification({
-            notificationId: `cgateweb_cni_${networkId}`,
-            title: 'C-Bus network offline',
-            message: `The CNI/PCI link for C-Bus network ${networkId} has gone offline (InterfaceState=${interfaceState}). ` +
-                'C-Bus devices on this network are unreachable until it reconnects.',
-            token
-        }).then((r) => {
-            if (r.statusCode >= 200 && r.statusCode < 300) {
-                this.logger.info(`Raised Home Assistant notification: C-Bus network ${networkId} offline.`);
-            } else {
-                this.logger.warn(`HA persistent_notification.create returned ${r.statusCode} for network ${networkId}.`);
-            }
-        }).catch((e) => this.logger.warn(`Failed to send HA CNI notification for network ${networkId}: ${e.message}`));
-    }
-
-    _dismissCniNotification(networkId) {
-        const token = process.env.SUPERVISOR_TOKEN;
-        if (!token) return;
-        haNotifier.dismissPersistentNotification({
-            notificationId: `cgateweb_cni_${networkId}`,
-            token
-        }).catch((e) => this.logger.debug(`Failed to dismiss HA CNI notification for network ${networkId}: ${e.message}`));
+        return this.cniNotificationManager.handleReading(networkId, reading);
     }
 
     _getBridgeStatus() {
@@ -641,12 +661,7 @@ class CgateWebBridge {
             version: require('../package.json').version,
             uptime: process.uptime(),
             ready,
-            lifecycle: {
-                state: this._lifecycle.state,
-                reason: this._lifecycle.reason,
-                since: this._lifecycle.since,
-                transitions: this._lifecycle.transitions
-            },
+            lifecycle: this.bridgeReadiness.getLifecycleSnapshot(),
             connections: {
                 mqtt: mqttConnected,
                 commandPool: {
@@ -675,30 +690,15 @@ class CgateWebBridge {
 
     _updateBridgeReadiness(reason = 'state-change') {
         const commandStats = this.commandConnectionPool ? this.commandConnectionPool.getStats() : null;
-        const ready = !!(
-            this.mqttManager.connected &&
-            this.eventConnection.connected &&
-            commandStats &&
-            commandStats.healthyConnections > 0
-        );
-        if (ready) {
-            this._hasEverBeenReady = true;
-            this._setLifecycleState('ready', reason);
-        } else if (this._lifecycle.state !== 'stopping') {
-            this._setLifecycleState(this._hasEverBeenReady ? 'degraded' : 'booting', reason);
-        }
-        this.mqttManager.setBridgeReady(ready, reason);
-        this.haBridgeDiagnostics.publishNow(reason);
+        return this.bridgeReadiness.update({
+            mqttConnected: this.mqttManager.connected,
+            eventConnected: this.eventConnection.connected,
+            healthyCommandConnections: commandStats ? commandStats.healthyConnections : 0
+        }, reason);
     }
 
     _setLifecycleState(state, reason) {
-        if (this._lifecycle.state === state && this._lifecycle.reason === reason) return;
-        if (this._lifecycle.state !== state) {
-            this._lifecycle.transitions += 1;
-        }
-        this._lifecycle.state = state;
-        this._lifecycle.reason = reason;
-        this._lifecycle.since = Date.now();
+        return this.bridgeReadiness.setLifecycleState(state, reason);
     }
 
     // Hot-reloads settings that can be applied without reconnecting.
