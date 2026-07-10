@@ -3,6 +3,7 @@ const { createLogger } = require('./logger');
 const { getDiscoveryTypeForApp, getDiscoveryConfig } = require('./haDiscoveryConfigs');
 const { classifyLightingGroup } = require('./deviceTypeClassifier');
 const { findNetworkData, collectUnitGroups, networkHasDeviceData } = require('./haDiscoveryTree');
+const { buildOriginBlock, buildDeviceBlock } = require('./haDiscoveryPayloads');
 const { backoffDelay } = require('./backoff');
 const {
     DEFAULT_CBUS_APP_LIGHTING,
@@ -44,9 +45,6 @@ const {
     HA_DEVICE_MANUFACTURER,
     HA_MODEL_LIGHTING,
     HA_MODEL_TRIGGER,
-    HA_ORIGIN_NAME,
-    HA_ORIGIN_SW_VERSION,
-    HA_ORIGIN_SUPPORT_URL,
     DISCOVERY_STATE_DISCOVERING,
     DISCOVERY_STATE_OK,
     DISCOVERY_STATE_PAUSED,
@@ -431,11 +429,7 @@ class HaDiscovery {
                 manufacturer: HA_DEVICE_MANUFACTURER,
                 model: 'Bridge Diagnostics'
             },
-            origin: {
-                name: HA_ORIGIN_NAME,
-                sw_version: HA_ORIGIN_SW_VERSION,
-                support_url: HA_ORIGIN_SUPPORT_URL
-            }
+            origin: buildOriginBlock()
         };
 
         this._publish(configTopic, JSON.stringify(payload), MQTT_RETAINED_STATE_OPTIONS);
@@ -625,6 +619,18 @@ class HaDiscovery {
             areas: this.areas
         };
 
+        // Wrap the synchronous discovery run so per-run state (label snapshot,
+        // current-run topic set) is always cleared even if a helper throws
+        // mid-run. Otherwise stale references could be read by later code.
+        try {
+            this._runDiscoveryFromTree(networkId, networkData, startTime);
+        } finally {
+            this._labelSnapshot = null;
+            this._currentRunTopics = null;
+        }
+    }
+
+    _runDiscoveryFromTree(networkId, networkData, startTime) {
         let units = networkData.Unit || [];
         if (!Array.isArray(units)) {
             units = [units];
@@ -697,7 +703,6 @@ class HaDiscovery {
         for (const topic of this._currentRunTopics) {
             this._publishedTopics.add(topic);
         }
-        this._currentRunTopics = null;
 
         const duration = Date.now() - startTime;
         const { custom, treexml, fallback } = this.labelStats;
@@ -717,10 +722,6 @@ class HaDiscovery {
         } else {
             this.logger.info(`HA Discovery completed for network ${networkId}. Published ${this.discoveryCount} entities (took ${duration}ms). Labels: ${custom} custom, ${treexml} from TREEXML, ${fallback} fallback`);
         }
-
-        // Clear snapshot so any later code that reaches for it without an
-        // active discovery run fails loudly rather than reading stale data.
-        this._labelSnapshot = null;
     }
 
     /**
@@ -817,19 +818,13 @@ class HaDiscovery {
             qos: 0,
             // command topics must NOT be retained: a retained command replays to
             // cgateweb on every reconnect and re-toggles the light (see _createDiscovery).
-            device: {
+            device: buildDeviceBlock({
                 identifiers: [uniqueId],
                 name: finalLabel,
-                manufacturer: HA_DEVICE_MANUFACTURER,
                 model: HA_MODEL_LIGHTING,
-                via_device: HA_DEVICE_VIA,
-                ...(area && { suggested_area: area })
-            },
-            origin: {
-                name: HA_ORIGIN_NAME,
-                sw_version: HA_ORIGIN_SW_VERSION,
-                support_url: HA_ORIGIN_SUPPORT_URL
-            }
+                area
+            }),
+            origin: buildOriginBlock()
         };
 
         this._publish(discoveryTopic, JSON.stringify(payload), MQTT_RETAINED_STATE_OPTIONS);
@@ -958,18 +953,12 @@ class HaDiscovery {
             payload_on: MQTT_STATE_ON,
             payload_off: MQTT_STATE_OFF,
             qos: 0,
-            device: {
+            device: buildDeviceBlock({
                 identifiers: [`cgateweb_network_${net}`],
                 name: `C-Bus Network ${net}`,
-                manufacturer: HA_DEVICE_MANUFACTURER,
-                model: 'C-Bus Network Interface',
-                via_device: HA_DEVICE_VIA
-            },
-            origin: {
-                name: HA_ORIGIN_NAME,
-                sw_version: HA_ORIGIN_SW_VERSION,
-                support_url: HA_ORIGIN_SUPPORT_URL
-            }
+                model: 'C-Bus Network Interface'
+            }),
+            origin: buildOriginBlock()
         };
 
         this._publish(discoveryTopic, JSON.stringify(payload), MQTT_RETAINED_STATE_OPTIONS);
@@ -1060,19 +1049,13 @@ class HaDiscovery {
             temp_step: 0.5,
 
             qos: 0,
-            device: {
+            device: buildDeviceBlock({
                 identifiers: [uniqueId],
                 name: finalLabel,
-                manufacturer: HA_DEVICE_MANUFACTURER,
                 model: 'C-Bus Air Conditioning Thermostat',
-                via_device: HA_DEVICE_VIA,
-                ...(area && { suggested_area: area })
-            },
-            origin: {
-                name: HA_ORIGIN_NAME,
-                sw_version: HA_ORIGIN_SW_VERSION,
-                support_url: HA_ORIGIN_SUPPORT_URL
-            }
+                area
+            }),
+            origin: buildOriginBlock()
         };
 
         this._publish(discoveryTopic, JSON.stringify(payload), MQTT_RETAINED_STATE_OPTIONS);
@@ -1161,19 +1144,13 @@ class HaDiscovery {
 
             qos: 0,
             // command topics must NOT be retained (see _createDiscovery note)
-            device: {
+            device: buildDeviceBlock({
                 identifiers: [uniqueId],
                 name: finalLabel,
-                manufacturer: HA_DEVICE_MANUFACTURER,
                 model: 'HVAC Zone (Air Conditioning)',
-                via_device: HA_DEVICE_VIA,
-                ...(area && { suggested_area: area })
-            },
-            origin: {
-                name: HA_ORIGIN_NAME,
-                sw_version: HA_ORIGIN_SW_VERSION,
-                support_url: HA_ORIGIN_SUPPORT_URL
-            }
+                area
+            }),
+            origin: buildOriginBlock()
         };
 
         this._publish(discoveryTopic, JSON.stringify(payload), MQTT_RETAINED_STATE_OPTIONS);
@@ -1234,19 +1211,13 @@ class HaDiscovery {
             // ON/OFF/RAMP commands that toggle devices unexpectedly. State retention is
             // handled separately by the read/state publish options, not here.
             ...(config.deviceClass && { device_class: config.deviceClass }),
-            device: {
+            device: buildDeviceBlock({
                 identifiers: [uniqueId],
                 name: finalLabel,
-                manufacturer: HA_DEVICE_MANUFACTURER,
                 model: config.model,
-                via_device: HA_DEVICE_VIA,
-                ...(area && { suggested_area: area })
-            },
-            origin: {
-                name: HA_ORIGIN_NAME,
-                sw_version: HA_ORIGIN_SW_VERSION,
-                support_url: HA_ORIGIN_SUPPORT_URL
-            }
+                area
+            }),
+            origin: buildOriginBlock()
         };
 
         this._publish(discoveryTopic, JSON.stringify(payload), MQTT_RETAINED_STATE_OPTIONS);
@@ -1279,18 +1250,12 @@ class HaDiscovery {
             payload_press: MQTT_STATE_ON,
             qos: 0,
             retain: false,
-            device: {
+            device: buildDeviceBlock({
                 identifiers: [`cgateweb_${networkId}_${appId}_${groupId}`],
                 name: label,
-                manufacturer: HA_DEVICE_MANUFACTURER,
-                model: HA_MODEL_TRIGGER,
-                via_device: HA_DEVICE_VIA
-            },
-            origin: {
-                name: HA_ORIGIN_NAME,
-                sw_version: HA_ORIGIN_SW_VERSION,
-                support_url: HA_ORIGIN_SUPPORT_URL
-            }
+                model: HA_MODEL_TRIGGER
+            }),
+            origin: buildOriginBlock()
         };
 
         this._publish(discoveryTopic, JSON.stringify(payload), MQTT_RETAINED_STATE_OPTIONS);
@@ -1312,18 +1277,12 @@ class HaDiscovery {
             payload_on: MQTT_STATE_ON,
             qos: 0,
             retain: false,
-            device: {
+            device: buildDeviceBlock({
                 identifiers: [`cgateweb_${networkId}_${appId}_${groupId}`],
                 name: label,
-                manufacturer: HA_DEVICE_MANUFACTURER,
-                model: HA_MODEL_TRIGGER,
-                via_device: HA_DEVICE_VIA
-            },
-            origin: {
-                name: HA_ORIGIN_NAME,
-                sw_version: HA_ORIGIN_SW_VERSION,
-                support_url: HA_ORIGIN_SUPPORT_URL
-            }
+                model: HA_MODEL_TRIGGER
+            }),
+            origin: buildOriginBlock()
         };
 
         this._publish(discoveryTopic, JSON.stringify(payload), MQTT_RETAINED_STATE_OPTIONS);
