@@ -5,6 +5,60 @@ All notable changes to the C-Gate Web Bridge Home Assistant add-on will be docum
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.15.9] - 2026-07-11
+
+### Fixed
+
+- **Distribution publish no longer skips when the optional C-Gate upload integration job is skipped.** The deploy job now uses `always()` plus explicit success checks on required gates (GitHub Actions otherwise skips deploy whenever any upstream job was skipped).
+
+## [1.15.8] - 2026-07-11
+
+### Fixed
+
+- **aarch64 add-on image builds no longer crash during `npm ci` under QEMU.** Production deps are installed on the build-host arch (pure JS/WASM) via BuildKit `BUILDPLATFORM`, then copied into the target image.
+- ESLint unused-variable warning in webServer tests that blocked the distribution test job (and therefore skipped C-Gate integration).
+
+### Changed
+
+- CI/distribution add-on image builds use Docker Buildx with explicit target platforms.
+
+## [1.15.7] - 2026-07-11
+
+### Fixed
+
+- **armv7 add-on images build again.** Alpine 3.19 has no OpenJDK 17 package on armv7; the Dockerfile now falls back to OpenJDK 8 on arches that lack OpenJDK 17 so distribution can publish (unblocking the failed 1.15.6 ship).
+- **Sensitive web reads and SSE require the same auth as mutations** (`/api/labels`, status, dashboard, areas, export, event stream). `/healthz` and `/readyz` stay public. Ingress URL is no longer logged at startup.
+- Uploaded C-Gate zips without `cgate_download_sha256` now log the same integrity-skip warning as the download path.
+
+### Changed
+
+- Distribution publish runs only from `v*` tags (not arbitrary `workflow_dispatch` refs) and uses workflow concurrency to avoid overlapping deploys.
+- Pool reconnect backoff honours `reconnectinitialdelay` / `reconnectmaxdelay`. New tunables: `initDebounceMs`, `webSseKeepaliveMs`, `eventLogMaxEntries`, `mqttPendingPublishMaxEntries`.
+- Runtime warns when `mqttRejectUnauthorized` is false (MITM risk). Operator docs cover MQTT broker ACL requirements.
+- Internal: HaDiscovery tree/publishers split into modules; addon option mapping is table-driven. No intentional behaviour change from those refactors.
+
+### Tests
+
+- ThrottledQueue priority/gating/onDrop coverage and bridge command-queue pool gating tests.
+
+## [1.15.6] - 2026-07-11
+
+### Fixed
+
+- **Web mutation auth no longer trusts a spoofed `X-Ingress-Path` on the direct port.** Ingress requests must match the configured ingress path and include `X-Hass-Source: core.ingress`. Host port 8080 is no longer mapped by default (ingress still works); set `web_api_key` if you re-expose the port.
+- **PUT `/api/labels` now strips prototype-polluting keys** the same way PATCH already did.
+- **Network auto-discovery skips the project-level `tree` probe** when `getall_networks` / `ha_discovery_networks` are already configured, avoiding the recurring C-Gate 402 on typical HA installs. Residual 402 responses log at debug.
+- **Startup no longer WARNs about MQTT publish queueing before the first connect.** Mid-session disconnects still warn. Retained publishes continue to queue and replay.
+- **MQTT authentication failure no longer restart-loops the Home Assistant add-on.** Standalone still exits fatally; add-on mode stays alive, throttles the banner, and retries.
+- **Unsafe C-Gate project names and LOGIN credentials are rejected** so newlines/spaces cannot inject extra commands on the C-Gate socket.
+- **Failed C-Gate command sends publish a warning** on `hello/cgateweb/warnings` instead of failing silently.
+- **Stale TreeXML parse callbacks are ignored** after a newer request for the same network, and overlapping TREEXML requests are deduped across session and parse windows.
+
+### Changed
+
+- Concurrent SSE event-stream connections are capped (default 32) to limit DoS on an exposed web port.
+- Distribution releases now require multi-arch add-on image builds and C-Gate integration tests (plus schema/i18n validation and typecheck) before publishing.
+
 ## [1.15.5] - 2026-07-10
 
 ### Added

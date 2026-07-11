@@ -49,6 +49,10 @@ class WebServer {
         this.triggerAppId = options.triggerAppId || null;
         this.eventStream = options.eventStream || null;
         this._sseKeepaliveMs = options._sseKeepaliveMs || 15000;
+        this.maxSseConnections = Number.isFinite(options.maxSseConnections) && options.maxSseConnections > 0
+            ? options.maxSseConnections
+            : 32;
+        this._sseActiveConnections = 0;
         this.getStatus = options.getStatus || (() => ({}));
         this.deviceStateManager = options.deviceStateManager || null;
         this.apiKey = options.apiKey || null;
@@ -157,7 +161,7 @@ class WebServer {
                 return;
             }
 
-            if (this._isMutatingApiRoute(urlPath, req.method) && !this._isAuthorizedMutation(req)) {
+            if (this._requiresApiAuth(urlPath, req.method) && !this._isAuthorizedApi(req)) {
                 return this._sendJSON(res, 401, { error: 'Unauthorized' });
             }
 
@@ -242,12 +246,12 @@ class WebServer {
                 version: 1,
                 source: 'web-ui',
                 generated: new Date().toISOString(),
-                labels: data.labels
+                labels: this._sanitizePlainObject(data.labels)
             };
-            if (data.type_overrides) fileData.type_overrides = data.type_overrides;
-            if (data.entity_ids) fileData.entity_ids = data.entity_ids;
+            if (data.type_overrides) fileData.type_overrides = this._sanitizePlainObject(data.type_overrides);
+            if (data.entity_ids) fileData.entity_ids = this._sanitizePlainObject(data.entity_ids);
+            if (data.areas) fileData.areas = this._sanitizePlainObject(data.areas);
             if (data.exclude) fileData.exclude = data.exclude;
-            if (data.areas) fileData.areas = data.areas;
 
             this.labelLoader.save(fileData);
             const fullData = this.labelLoader.getFullData();
@@ -282,7 +286,7 @@ class WebServer {
             for (const [key, value] of Object.entries(patch)) {
                 // Defence in depth: never let untrusted input write prototype-
                 // polluting keys, even though label values are strings.
-                if (key === '__proto__' || key === 'constructor' || key === 'prototype') continue;
+                if (this._isUnsafeObjectKey(key)) continue;
                 if (value === null || value === '') {
                     delete existing[key];
                 } else {
@@ -574,6 +578,11 @@ class WebServer {
     }
 
     _handleEventStream(req, res) {
+        if (this._sseActiveConnections >= this.maxSseConnections) {
+            return this._sendJSON(res, 503, { error: 'Too many event stream connections' });
+        }
+        this._sseActiveConnections += 1;
+
         res.writeHead(200, {
             'Content-Type': 'text/event-stream',
             'Cache-Control': 'no-cache',
@@ -602,7 +611,7 @@ class WebServer {
         }
 
         // Keepalive comment every 15 seconds to prevent proxy timeouts
-        const keepaliveMs = this._sseKeepaliveMs || 15000;
+        const keepaliveMs = this._sseKeepaliveMs;
         const keepaliveInterval = setInterval(() => {
             res.write(': keepalive\n\n');
         }, keepaliveMs);
@@ -611,6 +620,7 @@ class WebServer {
         // Clean up on client disconnect
         req.on('close', () => {
             clearInterval(keepaliveInterval);
+            this._sseActiveConnections = Math.max(0, this._sseActiveConnections - 1);
             if (this.eventStream) {
                 this.eventStream.unsubscribe(listener);
             }
@@ -681,6 +691,29 @@ class WebServer {
         return urlPath === '/api/labels' || urlPath === '/api/labels/import';
     }
 
+    /**
+     * Sensitive API routes that expose labels, device state, or live events.
+     * Health probes stay public so Supervisor/Docker can check liveness without
+     * credentials. Static UI assets also stay public; the UI's API calls are gated.
+     */
+    _isSensitiveReadRoute(urlPath, method) {
+        if (method !== 'GET') return false;
+        return urlPath === '/api/labels'
+            || urlPath === '/api/labels/export.xml'
+            || urlPath === '/api/status'
+            || urlPath === '/api/dashboard'
+            || urlPath === '/api/areas'
+            || urlPath === '/api/events/stream';
+    }
+
+    _requiresApiAuth(urlPath, method) {
+        return this._isMutatingApiRoute(urlPath, method) || this._isSensitiveReadRoute(urlPath, method);
+    }
+
+    _isAuthorizedApi(req) {
+        return this._isAuthorizedMutation(req);
+    }
+
     _isAuthorizedMutation(req) {
         if (!this.apiKey) {
             // Requests proxied through Home Assistant Ingress have already been
@@ -710,14 +743,31 @@ class WebServer {
         return crypto.timingSafeEqual(providedBuf, expectedBuf);
     }
 
+    _isUnsafeObjectKey(key) {
+        return key === '__proto__' || key === 'constructor' || key === 'prototype';
+    }
+
+    _sanitizePlainObject(obj) {
+        if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return obj;
+        const out = {};
+        for (const [key, value] of Object.entries(obj)) {
+            if (this._isUnsafeObjectKey(key)) continue;
+            out[key] = value;
+        }
+        return out;
+    }
+
     _isIngressRequest(req) {
-        // Only trust the ingress marker when the server was actually started in
-        // ingress mode (INGRESS_ENTRY -> basePath). This prevents a spoofed
-        // X-Ingress-Path header from bypassing auth on a standalone deployment
-        // that is not fronted by the Supervisor proxy.
+        // Only trust ingress markers when the server was started in ingress mode
+        // (INGRESS_ENTRY -> basePath). Require an exact path match plus HA Core's
+        // X-Hass-Source so a casual spoofed X-Ingress-Path on the direct :8080
+        // port cannot authorize mutations.
         if (!this.basePath) return false;
         const ingressPath = req.headers['x-ingress-path'];
-        return typeof ingressPath === 'string' && ingressPath.length > 0;
+        if (typeof ingressPath !== 'string' || ingressPath.length === 0) return false;
+        const normalized = ingressPath.replace(/\/+$/, '');
+        if (normalized !== this.basePath) return false;
+        return req.headers['x-hass-source'] === 'core.ingress';
     }
 
     _setCorsHeaders(req, res) {

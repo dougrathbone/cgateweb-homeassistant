@@ -46,6 +46,11 @@ class MqttManager extends EventEmitter {
         this._lastStatusPayload = null;
         this._droppedPublishCount = 0;
         this._droppedPublishWarned = false;
+        // Sticky for process lifetime: first-boot publishes before MQTT connects
+        // are expected (diagnostics during start()); only warn after we have
+        // successfully connected at least once (true mid-session disconnect).
+        this._hasConnectedOnce = false;
+        this._authFailureLogged = false;
 
         // Pre-connect / disconnect publish queue. Retained-state publishes
         // attempted while the broker is unreachable are queued here and
@@ -138,7 +143,12 @@ class MqttManager extends EventEmitter {
                 this._enqueueRetainedPublish(topic, payload, options);
             }
             if (!this._droppedPublishWarned) {
-                this.logger.warn('MQTT not connected; queueing retained publishes for replay on reconnect (further drops suppressed)');
+                const msg = 'MQTT not connected; queueing retained publishes for replay on reconnect (further drops suppressed)';
+                if (this._hasConnectedOnce) {
+                    this.logger.warn(msg);
+                } else {
+                    this.logger.debug(msg);
+                }
                 this._droppedPublishWarned = true;
             }
             return false;
@@ -252,6 +262,10 @@ class MqttManager extends EventEmitter {
 
         if (this.settings.mqttRejectUnauthorized === false) {
             options.rejectUnauthorized = false;
+            this.logger.warn(
+                'MQTT TLS certificate verification is disabled (mqttRejectUnauthorized=false). ' +
+                'Connections are vulnerable to man-in-the-middle attacks. Prefer mqttCaFile with a trusted CA, or keep verification enabled.'
+            );
         }
 
         return options;
@@ -260,6 +274,8 @@ class MqttManager extends EventEmitter {
     _handleConnect() {
         this._connecting = false;
         this.connected = true;
+        this._hasConnectedOnce = true;
+        this._authFailureLogged = false;
         this.logger.info(`CONNECTED TO MQTT BROKER: ${this.settings.mqtt}`);
 
         if (this._pendingPublishEvicted > 0) {
@@ -306,46 +322,62 @@ class MqttManager extends EventEmitter {
         this.emit('close');
     }
 
+    _isAddonMode() {
+        return (this.settings && this.settings._environment && this.settings._environment.type === 'addon')
+            || !!process.env.SUPERVISOR_TOKEN;
+    }
+
     _handleError(err) {
         this.connected = false;
         
         if (err.code === MQTT_ERROR_AUTH) {
             const brokerUrl = this.settings.mqtt || '(not configured)';
             const hasUsername = !!this.settings.mqttusername;
-            const isAddon = !!process.env.SUPERVISOR_TOKEN;
+            const isAddon = this._isAddonMode();
 
-            this.logger.error('');
-            this.logger.error('==========================================================');
-            this.logger.error('  MQTT AUTHENTICATION FAILED');
-            this.logger.error('==========================================================');
-            this.logger.error(`  Broker: ${brokerUrl}`);
-            this.logger.error(`  Username provided: ${hasUsername ? 'yes' : 'NO'}`);
-            this.logger.error('');
-            if (!hasUsername) {
-                this.logger.error('  No MQTT credentials were configured.');
-                if (isAddon) {
-                    this.logger.error('  To fix this in Home Assistant:');
-                    this.logger.error('    1. Go to Settings > Add-ons > C-Gate Web Bridge > Configuration');
-                    this.logger.error('    2. Set mqtt_username and mqtt_password');
-                    this.logger.error('    3. Use the same credentials as your Mosquitto broker addon');
-                    this.logger.error('    4. Restart the C-Gate Web Bridge addon');
+            // Throttle the banner: mqtt.js will keep reconnecting and re-emitting
+            // auth errors; one clear message per failure window is enough.
+            if (!this._authFailureLogged) {
+                this._authFailureLogged = true;
+                this.logger.error('');
+                this.logger.error('==========================================================');
+                this.logger.error('  MQTT AUTHENTICATION FAILED');
+                this.logger.error('==========================================================');
+                this.logger.error(`  Broker: ${brokerUrl}`);
+                this.logger.error(`  Username provided: ${hasUsername ? 'yes' : 'NO'}`);
+                this.logger.error('');
+                if (!hasUsername) {
+                    this.logger.error('  No MQTT credentials were configured.');
+                    if (isAddon) {
+                        this.logger.error('  To fix this in Home Assistant:');
+                        this.logger.error('    1. Go to Settings > Add-ons > C-Gate Web Bridge > Configuration');
+                        this.logger.error('    2. Set mqtt_username and mqtt_password');
+                        this.logger.error('    3. Use the same credentials as your Mosquitto broker addon');
+                        this.logger.error('    4. Save and wait — the bridge will retry without a full restart');
+                    } else {
+                        this.logger.error('  To fix this:');
+                        this.logger.error('    1. Edit your settings.js file');
+                        this.logger.error('    2. Set exports.mqttusername and exports.mqttpassword');
+                        this.logger.error('    3. Restart cgateweb');
+                    }
                 } else {
-                    this.logger.error('  To fix this:');
-                    this.logger.error('    1. Edit your settings.js file');
-                    this.logger.error('    2. Set exports.mqttusername and exports.mqttpassword');
-                    this.logger.error('    3. Restart cgateweb');
+                    this.logger.error('  Credentials were provided but the broker rejected them.');
+                    this.logger.error('  Check that the username and password are correct.');
+                    if (isAddon) {
+                        this.logger.error('  The bridge will keep retrying; fix credentials in the add-on config.');
+                    }
                 }
-            } else {
-                this.logger.error('  Credentials were provided but the broker rejected them.');
-                this.logger.error('  Check that the username and password are correct.');
+                this.logger.error('==========================================================');
+                this.logger.error('');
             }
-            this.logger.error('==========================================================');
-            this.logger.error('');
 
+            // Fatal in standalone (clear misconfig signal). Non-fatal in the
+            // add-on so Supervisor/s6 does not restart-loop and spam logs.
             this.errorHandler.handle(err, {
                 brokerUrl,
-                hasUsername
-            }, 'MQTT authentication', true); // Fatal error
+                hasUsername,
+                addonMode: isAddon
+            }, 'MQTT authentication', !isAddon);
         } else {
             this.errorHandler.handle(err, {
                 brokerUrl: this.settings.mqtt,

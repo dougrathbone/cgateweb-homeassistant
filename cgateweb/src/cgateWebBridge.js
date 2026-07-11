@@ -261,6 +261,8 @@ class CgateWebBridge {
             activeDeviceWindowMs: this.settings.web_active_device_window_ms,
             haAreasCacheTtlMs: this.settings.web_ha_areas_cache_ttl_ms,
             haApiTimeoutMs: this.settings.web_ha_api_timeout_ms,
+            maxSseConnections: this.settings.web_max_sse_connections,
+            _sseKeepaliveMs: this.settings.webSseKeepaliveMs,
             triggerAppId: this.settings.ha_discovery_trigger_app_id || null,
             getStatus: () => this._getBridgeStatus(),
             deviceStateManager: this.deviceStateManager,
@@ -316,12 +318,12 @@ class CgateWebBridge {
      * @private
      */
     _buildEventLogBuffer() {
-        const EVENT_LOG_MAX = 200;
+        const eventLogMax = Math.max(10, Number(this.settings.eventLogMaxEntries) || 200);
         this._eventLogBuffer = [];
         this._eventLogListeners = new Set();
         this._onEventLog = (entry) => {
             this._eventLogBuffer.push(entry);
-            if (this._eventLogBuffer.length > EVENT_LOG_MAX) {
+            if (this._eventLogBuffer.length > eventLogMax) {
                 this._eventLogBuffer.shift();
             }
             for (const fn of this._eventLogListeners) {
@@ -578,6 +580,13 @@ class CgateWebBridge {
             await this.commandConnectionPool.execute(command);
         } catch (error) {
             this.logger.error('Failed to send C-Gate command:', { command, error });
+            const trimmed = String(command || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+            const detail = error && error.message ? error.message : String(error);
+            this.mqttManager.publish(
+                'hello/cgateweb/warnings',
+                `C-Gate command send failed: ${trimmed} (${detail})`,
+                { retain: false }
+            );
         }
     }
 

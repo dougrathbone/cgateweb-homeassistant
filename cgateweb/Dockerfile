@@ -1,19 +1,19 @@
 ARG BUILD_FROM
 
 # ----------------------------------------------------------------------------
-# Builder stage: only purpose is to run `npm ci`. npm + its deps are ~50-80MB
-# on Alpine and are never needed at runtime, so we isolate them here and
-# carry only node_modules forward.
+# Builder stage: install production node_modules on the *build host* arch.
+# Production deps (mqtt, xml2js, adm-zip, sql.js) are pure JS/WASM, so the
+# tree is portable across Alpine arches. Running `npm ci` under QEMU for
+# aarch64/armv7 has caused intermittent SIGILL crashes in CI.
 # ----------------------------------------------------------------------------
-FROM $BUILD_FROM AS builder
-
-SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+ARG BUILDPLATFORM
+FROM --platform=${BUILDPLATFORM:-linux/amd64} alpine:3.19 AS builder
 
 RUN apk add --no-cache nodejs npm
 
 WORKDIR /app
 COPY package*.json ./
-RUN npm ci --only=production && \
+RUN npm ci --omit=dev && \
     npm cache clean --force
 
 # ----------------------------------------------------------------------------
@@ -25,13 +25,22 @@ FROM $BUILD_FROM
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
+# OpenJDK 17 is not packaged for every Alpine arch (notably armv7/armhf on
+# 3.19). Prefer 17 where available; fall back to OpenJDK 8 so managed-mode
+# C-Gate still has a JRE on 32-bit ARM. Remote-mode users only need nodejs.
+ARG BUILD_ARCH
 RUN \
     apk add --no-cache \
         nodejs \
-        openjdk17-jre-headless \
         curl \
         unzip \
-        netcat-openbsd
+        netcat-openbsd && \
+    if apk add --no-cache openjdk17-jre-headless; then \
+        echo "Installed openjdk17-jre-headless (arch=${BUILD_ARCH:-unknown})"; \
+    else \
+        echo "openjdk17 unavailable; installing openjdk8-jre-base (arch=${BUILD_ARCH:-unknown})"; \
+        apk add --no-cache openjdk8-jre-base; \
+    fi
 
 WORKDIR /app
 
