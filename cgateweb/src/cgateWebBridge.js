@@ -18,9 +18,10 @@ const { NetworkInterfaceMonitor } = require('./networkInterfaceMonitor');
 const { AirconControlRegistry } = require('./airconControlRegistry');
 const CniNotificationManager = require('./cniNotificationManager');
 const BridgeReadiness = require('./bridgeReadiness');
+const { discoverIngressEntry } = require('./ingressDiscovery');
 const { createLogger } = require('./logger');
 const { LineProcessor } = require('./lineProcessor');
-const { MQTT_RETAINED_STATE_OPTIONS } = require('./constants');
+const { MQTT_RETAINED_STATE_OPTIONS, CGATE_EVENT_NETWORK_SYNC_REGEX } = require('./constants');
 const { clampSetting } = require('./utils');
 const { parseRawCaptureTarget } = require('./rawEventCapture');
 
@@ -246,7 +247,10 @@ class CgateWebBridge {
             logger: this.logger
         });
 
-        // Web server for label editing UI
+        // Web server for label editing UI. In add-on mode nothing injects
+        // INGRESS_ENTRY, so the ingress base path is discovered from the
+        // Supervisor API after startup (see _discoverIngressBasePath);
+        // INGRESS_ENTRY remains an explicit override when set.
         const ingressBasePath = process.env.INGRESS_ENTRY || '';
         this.webServer = new WebServer({
             port: this.settings.web_port || 8080,
@@ -411,7 +415,48 @@ class CgateWebBridge {
             this.logger.warn(`Web server failed to start: ${err.message}`);
         });
 
+        // Fire-and-forget alongside the web server: learns the ingress base
+        // path and applies it once known (GitHub #33).
+        this._discoverIngressBasePath();
+
         return this;
+    }
+
+    /**
+     * Discovers the Home Assistant ingress entry path from the Supervisor API
+     * and applies it to the web server (GitHub #33).
+     *
+     * The web auth hardening only trusts HA-ingress-authenticated requests when
+     * the web server knows its ingress base path. The Supervisor never injects
+     * INGRESS_ENTRY into add-on containers, so without this lookup every
+     * ingress request 401s on a default install (no web_api_key). An explicit
+     * INGRESS_ENTRY env var still wins and skips the lookup.
+     * @private
+     * @returns {Promise<void>|null} discovery completion (awaitable in tests)
+     */
+    _discoverIngressBasePath() {
+        if (process.env.INGRESS_ENTRY) return null;
+        const supervisorToken = process.env.SUPERVISOR_TOKEN;
+        if (!supervisorToken) return null;
+
+        return discoverIngressEntry({ token: supervisorToken })
+            .then((ingressEntry) => {
+                if (ingressEntry) {
+                    this.webServer.setBasePath(ingressEntry);
+                    return;
+                }
+                this.logger.warn(
+                    'Could not determine the Home Assistant ingress path from the Supervisor API; ' +
+                    'label saves and imports through the ingress panel will be rejected (401). ' +
+                    'Set web_api_key to authenticate the web UI instead.'
+                );
+            })
+            .catch((err) => {
+                this.logger.warn(
+                    `Ingress path discovery failed: ${err.message}. ` +
+                    'Set web_api_key to authenticate the web UI through the ingress panel.'
+                );
+            });
     }
 
     /**
@@ -521,6 +566,20 @@ class CgateWebBridge {
             return;
         }
 
+        // C-Gate "Network sync ok" status event (code 762, visible at event
+        // level 6+): the network finished synchronising, so its tree is now
+        // fully populated. Forward to HA Discovery to re-fetch groups that
+        // were still empty (unsynced) at startup (issue #25). Not a CBusEvent,
+        // so return before the standard parse (avoids a spurious warning).
+        const syncedNetworkId = this._parseNetworkSyncComplete(line);
+        if (syncedNetworkId) {
+            this.logger.info(`C-Gate event: network ${syncedNetworkId} sync complete`);
+            if (this.haDiscovery) {
+                this.haDiscovery.handleNetworkSyncComplete(syncedNetworkId);
+            }
+            return;
+        }
+
         this._publishRawEventCapture(line);
 
         if (this.logger.isLevelEnabled && this.logger.isLevelEnabled('debug')) {
@@ -550,6 +609,17 @@ class CgateWebBridge {
     }
 
 
+
+    /**
+     * Parses a C-Gate "Network sync ok" status event (event code 762) from an
+     * event-port line, e.g. "20260718-123456.789 762 //PROJECT/254 Network
+     * sync ok". Returns the network id string, or null when the line is not a
+     * sync-complete event.
+     */
+    _parseNetworkSyncComplete(line) {
+        const match = line.match(CGATE_EVENT_NETWORK_SYNC_REGEX);
+        return match ? match[1] : null;
+    }
 
     /**
      * If the event's application is listed in settings.cbusRawEventLogApps, log

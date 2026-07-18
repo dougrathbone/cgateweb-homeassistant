@@ -1,6 +1,6 @@
 {
   "name": "cgateweb",
-  "version": "1.15.10",
+  "version": "1.15.11",
   "description": "Node.js bridge connecting Clipsal C-Bus automation systems to MQTT for Home Assistant integration",
   "keywords": [
     "cbus",
@@ -18,18 +18,18 @@
     "node": "^20.19.0 || ^22.13.0 || >=24"
   },
   "dependencies": {
-    "adm-zip": "^0.5.17",
+    "adm-zip": "^0.6.0",
     "mqtt": "^5.15.2",
     "sql.js": "^1.14.1",
     "xml2js": "^0.6.2"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
-    "@types/node": "^26.0.0",
-    "eslint": "^10.5.0",
-    "globals": "^17.6.0",
+    "@types/node": "^26.1.1",
+    "eslint": "^10.7.0",
+    "globals": "^17.7.0",
     "jest": "^30.4.2",
-    "typescript": "^6.0.3",
+    "typescript": "^7.0.2",
     "yaml": "^2.9.0"
   },
   "overrides": {
@@ -61,7 +61,7 @@
     "validate:translations": "node tools/validate-translations.js",
     "validate:schema-i18n": "node tools/validate-schema-i18n.js",
     "typecheck": "tsc --noEmit",
-    "lint": "eslint src/ tests/ tools/ index.js install-service.js uninstall-service.js",
+    "lint": "eslint src/ tests/ tools/ index.js install-service.js uninstall-service.js --max-warnings 0",
     "lint:fix": "eslint src/ tests/ tools/ index.js install-service.js uninstall-service.js --fix",
     "validate-settings": "node -e \"try { require('./settings.js'); console.log('Settings file is valid!'); } catch(e) { console.error('Settings file error:', e.message); process.exit(1); }\"",
     "check-setup": "node -e \"const { validateSetup } = require('./src/settingsValidator'); let settings; try { settings = require('./settings.js'); } catch(e) { settings = {}; } const result = validateSetup(settings); if (result.isFirstTime) { console.log(result.message); process.exit(1); } if (result.issues.length > 0) { console.log('Issues:', result.issues.join(', ')); } if (result.recommendations.length > 0) { console.log('Recommendations:', result.recommendations.join(', ')); } console.log(result.isValid ? 'Setup looks good!' : 'Please address the issues above');\""
@@ -69,7 +69,8 @@
   "jest": {
     "testPathIgnorePatterns": [
       "/node_modules/",
-      "/.claude/"
+      "/.claude/",
+      "/.worktrees/"
     ],
     "collectCoverageFrom": [
       "src/**/*.js",
