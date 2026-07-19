@@ -1,3 +1,4 @@
+// @ts-check
 const crypto = require('crypto');
 
 /**
@@ -58,7 +59,7 @@ class ApiAuth {
 
     /**
      * Whether the request is authorized for protected endpoints.
-     * @param {http.IncomingMessage} req
+     * @param {import('http').IncomingMessage} req
      * @returns {boolean}
      */
     isAuthorized(req) {
@@ -96,7 +97,7 @@ class ApiAuth {
      * API and applied via setBasePath). Require an exact path match plus HA
      * Core's X-Hass-Source so a casual spoofed X-Ingress-Path on the direct
      * :8080 port cannot authorize mutations.
-     * @param {http.IncomingMessage} req
+     * @param {import('http').IncomingMessage} req
      * @returns {boolean}
      */
     _isIngressRequest(req) {
@@ -104,7 +105,11 @@ class ApiAuth {
         if (!basePath) return false;
         const ingressPath = req.headers['x-ingress-path'];
         if (typeof ingressPath !== 'string' || ingressPath.length === 0) return false;
-        const normalized = ingressPath.replace(/\/+$/, '');
+        // Trim trailing slashes without a regex: /\/+$/ on an attacker-controlled
+        // header is a polynomial-backtracking (ReDoS) risk on slash-dense input.
+        let end = ingressPath.length;
+        while (end > 0 && ingressPath.charCodeAt(end - 1) === 47) end -= 1; // 47 = '/'
+        const normalized = ingressPath.slice(0, end);
         if (normalized !== basePath) return false;
         return req.headers['x-hass-source'] === 'core.ingress';
     }

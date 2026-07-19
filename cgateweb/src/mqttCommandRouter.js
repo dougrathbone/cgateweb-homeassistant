@@ -20,8 +20,10 @@ const {
     MQTT_CMD_TYPE_TRIGGER,
     MQTT_CMD_TYPE_HVAC_SETPOINT,
     MQTT_CMD_TYPE_HVAC_MODE,
+    MQTT_CMD_TYPE_HVAC_FAN_MODE,
     MQTT_TOPIC_SUFFIX_HVAC_SETPOINT,
     MQTT_TOPIC_SUFFIX_HVAC_MODE,
+    MQTT_TOPIC_SUFFIX_HVAC_FAN_MODE,
     MQTT_STATE_ON,
     MQTT_STATE_OFF,
     MQTT_COMMAND_STOP,
@@ -47,6 +49,10 @@ const {
     buildSetZoneHvacMode,
     buildSetWardOff
 } = require('./airconControlRegistry');
+
+// Debounce window for native-aircon setpoint writes (spec §25.12.11: wait a
+// few seconds after the user finishes adjusting, then send a single message).
+const AIRCON_SETPOINT_DEBOUNCE_MS = 3000;
 
 class MqttCommandRouter extends EventEmitter {
     /**
@@ -75,6 +81,8 @@ class MqttCommandRouter extends EventEmitter {
         this.settings = options.settings || {};
         // Per-thermostat ward/zone/type state for native Air Conditioning writes.
         this.airconControlRegistry = options.airconControlRegistry || null;
+        // Pending debounced native-aircon setpoint writes: "net/unit" -> { handle }.
+        this._airconSetpointTimers = new Map();
 
         // Use shared tracker if provided, otherwise create a private one
         this._coverRampTracker = options.coverRampTracker
@@ -162,6 +170,9 @@ class MqttCommandRouter extends EventEmitter {
                 break;
             case MQTT_CMD_TYPE_HVAC_MODE:
                 this._handleHvacMode(command, payload, topic);
+                break;
+            case MQTT_CMD_TYPE_HVAC_FAN_MODE:
+                this._handleHvacFanMode(command, payload, topic);
                 break;
             default:
                 this.logger.warn(`Unrecognized command type: ${commandType}`);
@@ -635,23 +646,73 @@ class MqttCommandRouter extends EventEmitter {
             return;
         }
         const clamped = Math.max(HVAC_MIN_TEMP_C, Math.min(HVAC_MAX_TEMP_C, tempC));
+        // Optimistically reflect the new target so the HA card updates instantly,
+        // then debounce the actual command: the thermostat echoes each Set Zone
+        // HVAC Mode message, so streaming increments causes race conditions —
+        // §25.12.11 says wait until the user has finished, then send one message.
+        this._publishOptimisticHvacState(network, command.getApplication(), unit, { setpointC: clamped });
+        this._debounceAirconSetpoint(network, command.getApplication(), unit, clamped);
+    }
+
+    /**
+     * Collapse rapid setpoint adjustments into a single AIRCON command sent a
+     * few seconds after the last change (spec §25.12.11 "Timeout on
+     * Adjustment"; §25.8.10 also recommends spacing these commands). The
+     * command is built at fire time from the then-current learned state.
+     * @private
+     */
+    _debounceAirconSetpoint(network, application, unit, clamped) {
+        const key = `${network}/${unit}`;
+        const pending = this._airconSetpointTimers.get(key);
+        if (pending) clearTimeout(pending.handle);
+        const handle = setTimeout(() => {
+            this._airconSetpointTimers.delete(key);
+            this._sendAirconSetpoint(network, application, unit, clamped);
+        }, AIRCON_SETPOINT_DEBOUNCE_MS);
+        if (typeof handle.unref === 'function') handle.unref();
+        this._airconSetpointTimers.set(key, { handle });
+        this.logger.debug(`Native HVAC setpoint: ${network}/${unit} -> ${clamped}°C queued (debounced ${AIRCON_SETPOINT_DEBOUNCE_MS}ms)`);
+    }
+
+    /**
+     * Cancel a pending (debounced) setpoint write, e.g. when the user switches
+     * mode instead — the latest explicit action wins.
+     * @private
+     */
+    _cancelPendingAirconSetpoint(network, unit) {
+        const pending = this._airconSetpointTimers.get(`${network}/${unit}`);
+        if (pending) {
+            clearTimeout(pending.handle);
+            this._airconSetpointTimers.delete(`${network}/${unit}`);
+        }
+    }
+
+    /**
+     * Actually send a debounced setpoint write, using the thermostat's current
+     * learned state (mode, flags, ward/zones/type) at fire time.
+     * @private
+     */
+    _sendAirconSetpoint(network, application, unit, clamped) {
+        const state = this.airconControlRegistry && this.airconControlRegistry.get(network, unit);
+        if (!state) return;
         const level = Math.round(clamped * 256); // °C × 256, temperature value (rawlevel=0)
+        const modeRaw = (state.modeRaw !== null && state.modeRaw !== undefined && state.modeRaw !== 0)
+            ? state.modeRaw : HVAC_CODE_BY_MODE.heat;
         const cmd = buildSetZoneHvacMode({
             cbusname: this.cbusname,
             network,
-            application: command.getApplication(),
+            application,
             ward: state.ward,
             zones: state.zones,
-            modeRaw: (state.modeRaw !== null && state.modeRaw !== undefined && state.modeRaw !== 0)
-                ? state.modeRaw : HVAC_CODE_BY_MODE.heat,
+            modeRaw,
             rawlevel: 0,
+            ...this._airconFlagEcho(state),
             type: (state.type !== null && state.type !== undefined) ? state.type : 0,
             level
         });
         this._queueCommand(cmd + NEWLINE);
-        // Optimistically reflect the new target so the HA card updates instantly
-        // rather than waiting for the thermostat's next broadcast.
-        this._publishOptimisticHvacState(network, command.getApplication(), unit, { setpointC: clamped });
+        // Keep the learned state coherent until the thermostat's echo broadcast.
+        this.airconControlRegistry.noteSetpointWrite(network, unit, modeRaw, level);
         this.logger.info(`Native HVAC setpoint: ${network}/${unit} -> ${clamped}°C (ward ${state.ward}, zones ${state.zones})`);
     }
 
@@ -665,9 +726,10 @@ class MqttCommandRouter extends EventEmitter {
      * @param {Object} [state] - State fields to publish
      * @param {string} [state.mode] - HVAC mode to publish
      * @param {number} [state.setpointC] - Target temperature in °C to publish
+     * @param {string} [state.fanMode] - Fan mode to publish
      * @private
      */
-    _publishOptimisticHvacState(network, application, unit, { mode, setpointC } = {}) {
+    _publishOptimisticHvacState(network, application, unit, { mode, setpointC, fanMode } = {}) {
         if (!this.mqttClient || typeof this.mqttClient.publish !== 'function') return;
         const base = `${MQTT_TOPIC_PREFIX_READ}/${network}/${application}/${unit}`;
         const opts = this.settings.retainreads ? MQTT_RETAINED_STATE_OPTIONS : { qos: 0 };
@@ -676,6 +738,9 @@ class MqttCommandRouter extends EventEmitter {
         }
         if (mode !== undefined && mode !== null) {
             this.mqttClient.publish(`${base}/${MQTT_TOPIC_SUFFIX_HVAC_MODE}`, String(mode), opts);
+        }
+        if (fanMode !== undefined && fanMode !== null) {
+            this.mqttClient.publish(`${base}/${MQTT_TOPIC_SUFFIX_HVAC_FAN_MODE}`, String(fanMode), opts);
         }
     }
 
@@ -697,6 +762,7 @@ class MqttCommandRouter extends EventEmitter {
 
         const mode = String(payload).toLowerCase();
         if (mode === 'off') {
+            this._cancelPendingAirconSetpoint(network, unit);
             this._queueCommand(buildSetWardOff({ cbusname: this.cbusname, network, application, ward: state.ward }) + NEWLINE);
             this._publishOptimisticHvacState(network, application, unit, { mode: 'off' });
             this.logger.info(`Native HVAC mode: ${network}/${unit} -> off (ward ${state.ward})`);
@@ -709,17 +775,8 @@ class MqttCommandRouter extends EventEmitter {
             return;
         }
 
-        let rawlevel;
-        let level;
-        if (mode === 'fan_only') {
-            rawlevel = 1;
-            level = FAN_LEVEL_SENTINEL;
-        } else {
-            rawlevel = 0;
-            level = (state.setpointRaw !== null && state.setpointRaw !== undefined && state.setpointRaw > 0 && state.setpointRaw <= 12800)
-                ? state.setpointRaw
-                : Math.round(DEFAULT_SETPOINT_C * 256);
-        }
+        this._cancelPendingAirconSetpoint(network, unit);
+        const { rawlevel, level } = this._airconLevelForModeRaw(state, code);
         const cmd = buildSetZoneHvacMode({
             cbusname: this.cbusname,
             network,
@@ -728,12 +785,126 @@ class MqttCommandRouter extends EventEmitter {
             zones: state.zones,
             modeRaw: code,
             rawlevel,
+            ...this._airconFlagEcho(state),
             type: (state.type !== null && state.type !== undefined) ? state.type : 0,
             level
         });
         this._queueCommand(cmd + NEWLINE);
         this._publishOptimisticHvacState(network, application, unit, { mode });
         this.logger.info(`Native HVAC mode: ${network}/${unit} -> ${mode} (ward ${state.ward}, zones ${state.zones})`);
+    }
+
+    /**
+     * Resolve the <Level> for a SET_ZONE_HVAC_MODE write: Fan Only carries the
+     * raw-level fan value; otherwise §25.12.11 says each Operating Type recalls
+     * its own Set Point — use the one learned for the target mode, falling back
+     * to the last seen target, then a default, when never observed.
+     * @private
+     */
+    _airconLevelForModeRaw(state, modeRaw) {
+        if (modeRaw === HVAC_CODE_BY_MODE.fan_only) {
+            return { rawlevel: 1, level: FAN_LEVEL_SENTINEL };
+        }
+        const byMode = state.setpointRawByMode && state.setpointRawByMode[modeRaw];
+        if (Number.isInteger(byMode) && byMode > 0 && byMode <= 12800) {
+            return { rawlevel: 0, level: byMode };
+        }
+        if (state.setpointRaw !== null && state.setpointRaw !== undefined && state.setpointRaw > 0 && state.setpointRaw <= 12800) {
+            return { rawlevel: 0, level: state.setpointRaw };
+        }
+        return { rawlevel: 0, level: Math.round(DEFAULT_SETPOINT_C * 256) };
+    }
+
+    /**
+     * HVAC fan mode command entry point (cbus/write/…/fanmode). Only the native
+     * Air Conditioning application supports it (via the Aux Level, §25.6.11);
+     * HVAC-via-lighting has no fan concept.
+     * @private
+     */
+    _handleHvacFanMode(command, payload, topic) {
+        if (this._isNativeAircon(command)) {
+            if (!this.settings.cbus_aircon_control_enabled) {
+                this.logger.warn(`Native HVAC control is disabled (set cbus_aircon_control_enabled to enable); ignoring fan mode on ${topic}`);
+                return;
+            }
+            return this._handleNativeAirconFanMode(command, payload, topic);
+        }
+        this.logger.warn(`HVAC fan mode is only supported on the native Air Conditioning application; ignoring ${topic}`);
+    }
+
+    /**
+     * Native Air Conditioning fan mode via the Aux Level (§25.6.3 A bit +
+     * §25.6.11): 'automatic' clears the aux-used flag (aux-controlled functions
+     * run automatically); 'continuous' sets Aux Level bit 6, preserving any
+     * learned fan-speed setting in bits 0-5. Mode and setpoint are kept from the
+     * thermostat's current state.
+     * @private
+     */
+    _handleNativeAirconFanMode(command, payload, topic) {
+        const network = command.getNetwork();
+        const unit = command.getGroup();
+        const application = command.getApplication();
+        const state = this.airconControlRegistry && this.airconControlRegistry.get(network, unit);
+        if (!state) {
+            this.logger.warn(`No known HVAC state for ${network}/${unit} yet; cannot set fan mode until the thermostat reports once (${topic})`);
+            return;
+        }
+
+        const fanMode = String(payload).toLowerCase();
+        let useaux;
+        let aux;
+        if (fanMode === 'automatic') {
+            useaux = 0;
+            aux = 0;
+        } else if (fanMode === 'continuous') {
+            useaux = 1;
+            aux = 0x40 | ((state.auxLevelUsed && Number.isInteger(state.auxLevel)) ? (state.auxLevel & 0x3F) : 0);
+        } else {
+            this.logger.warn(`Unknown HVAC fan mode "${payload}" on topic ${topic} (expected automatic|continuous)`);
+            return;
+        }
+
+        const modeRaw = (state.modeRaw !== null && state.modeRaw !== undefined && state.modeRaw !== 0)
+            ? state.modeRaw : HVAC_CODE_BY_MODE.heat;
+        this._cancelPendingAirconSetpoint(network, unit);
+        const { rawlevel, level } = this._airconLevelForModeRaw(state, modeRaw);
+        const flags = this._airconFlagEcho(state);
+        const cmd = buildSetZoneHvacMode({
+            cbusname: this.cbusname,
+            network,
+            application,
+            ward: state.ward,
+            zones: state.zones,
+            modeRaw,
+            rawlevel,
+            setback: flags.setback,
+            guard: flags.guard,
+            useaux,
+            type: (state.type !== null && state.type !== undefined) ? state.type : 0,
+            level,
+            aux
+        });
+        this._queueCommand(cmd + NEWLINE);
+        this.airconControlRegistry.noteAuxLevelWrite(network, unit, useaux === 1, aux);
+        this._publishOptimisticHvacState(network, application, unit, { fanMode });
+        this.logger.info(`Native HVAC fan mode: ${network}/${unit} -> ${fanMode} (ward ${state.ward}, zones ${state.zones})`);
+    }
+
+    /**
+     * Resolve the Mode & Flags byte fields (§25.6.3) and Aux Level for a write
+     * from the thermostat's learned broadcasts, so HA-originated commands echo
+     * its configuration instead of silently clearing setback/guard/aux state.
+     * Defaults mirror the thermostat-typical broadcast (setback 0, guard 0,
+     * aux used, aux level 0) when nothing has been learned.
+     * @private
+     */
+    _airconFlagEcho(state) {
+        return {
+            setback: state.setbackEnabled === true ? 1 : 0,
+            guard: state.guardEnabled === true ? 1 : 0,
+            useaux: state.auxLevelUsed === false ? 0 : 1,
+            aux: (state.auxLevelUsed && Number.isInteger(state.auxLevel)) ? state.auxLevel : 0
+        };
     }
 
     /**

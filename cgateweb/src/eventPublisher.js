@@ -1,3 +1,4 @@
+// @ts-check
 const { createLogger } = require('./logger');
 const { clampSetting, evictOldestFifo, temperatureToCbusLevel } = require('./utils');
 const {
@@ -15,6 +16,15 @@ const {
     MQTT_TOPIC_SUFFIX_HVAC_ACTION,
     MQTT_TOPIC_SUFFIX_HVAC_ERROR,
     MQTT_TOPIC_SUFFIX_HVAC_ERROR_DESCRIPTION,
+    MQTT_TOPIC_SUFFIX_HVAC_SENSOR_STATUS,
+    MQTT_TOPIC_SUFFIX_HVAC_PROBLEM,
+    MQTT_TOPIC_SUFFIX_HVAC_SENSOR_PROBLEM,
+    MQTT_TOPIC_SUFFIX_HVAC_CURRENT_HUMIDITY,
+    MQTT_TOPIC_SUFFIX_HVAC_HUMIDITY_SETPOINT,
+    MQTT_TOPIC_SUFFIX_HVAC_HUMIDITY_MODE,
+    MQTT_TOPIC_SUFFIX_HVAC_HUMIDITY_ACTION,
+    MQTT_TOPIC_SUFFIX_HVAC_FAN_SPEED_PCT,
+    MQTT_TOPIC_SUFFIX_HVAC_COMFORT_LEVEL,
     MQTT_STATE_ON,
     MQTT_STATE_OFF,
     CGATE_CMD_ON,
@@ -72,7 +82,7 @@ class EventPublisher {
      * Publishes directly to MQTT without throttling -- QoS 0 publishes are
      * near-instant TCP buffer writes handled asynchronously by the mqtt library.
      * 
-     * @param {CBusEvent} event - Parsed C-Bus event to publish
+     * @param {import('./cbusEvent')} event - Parsed C-Bus event to publish
      * @param {string} [source=''] - Source identifier for logging (e.g., '(Evt)', '(Cmd)')
      */
     publishEvent(event, source = '') {
@@ -90,7 +100,7 @@ class EventPublisher {
         // Specialised application decoders (e.g. Temperature Broadcast, app 25)
         // attach a structured reading to the event. Publish it to the dedicated
         // reading topic and skip the lighting/state path entirely.
-        const reading = event.getReading && event.getReading();
+        const reading = /** @type {{kind?: string}|null} */ (event.getReading && event.getReading());
         if (reading) {
             if (this.logger.isLevelEnabled && this.logger.isLevelEnabled('debug')) {
                 this.logger.debug(`C-Bus Reading ${source}: ${network}/${application}/${group} ${reading.kind}`);
@@ -235,13 +245,17 @@ class EventPublisher {
      * Publishes a structured reading produced by a specialised application
      * decoder (e.g. Air Conditioning). Routes by reading.kind:
      *
-     *   temperature → cbus/read/{net}/{app}/{group}/current_temperature
+     *   temperature → cbus/read/{net}/{app}/{group}/current_temperature (if celsius non-null)
+     *               → cbus/read/{net}/{app}/{group}/sensor_status + sensor_problem (if decoded)
      *   mode        → cbus/read/{net}/{app}/{group}/mode  (if mode non-null)
      *               → cbus/read/{net}/{app}/{group}/setpoint (if setpoint non-null)
      *               → cbus/read/{net}/{app}/{group}/fan_mode + fan_speed (if aux level decoded)
      *   state       → cbus/read/{net}/{app}/{group}/state  ('ON'|'OFF')
-     *   action      → cbus/read/{net}/{app}/{group}/action
+     *   action      → cbus/read/{net}/{app}/{group}/action + problem
      *               → cbus/read/{net}/{app}/{group}/error + error_description (if error code decoded)
+     *   humidity       → cbus/read/{net}/{app}/{group}/current_humidity (if non-null)
+     *   humidity_mode  → cbus/read/{net}/{app}/{group}/humidity_mode + humidity_setpoint
+     *   humidity_action → cbus/read/{net}/{app}/{group}/humidity_action
      */
     publishReading(network, application, group, reading) {
         if (!reading) return;
@@ -249,11 +263,29 @@ class EventPublisher {
         const base = `${MQTT_TOPIC_PREFIX_READ}/${network}/${application}/${group}`;
 
         if (reading.kind === 'temperature') {
-            this._publishIfNeeded(
-                `${base}/${MQTT_TOPIC_SUFFIX_HVAC_CURRENT_TEMP}`,
-                String(reading.celsius),
-                this.mqttOptions
-            );
+            // celsius is null when the sensor reports total failure (§25.8.6) —
+            // surface the status, not the meaningless temperature.
+            if (reading.celsius !== null && reading.celsius !== undefined) {
+                this._publishIfNeeded(
+                    `${base}/${MQTT_TOPIC_SUFFIX_HVAC_CURRENT_TEMP}`,
+                    String(reading.celsius),
+                    this.mqttOptions
+                );
+            }
+            if (reading.sensorStatus !== null && reading.sensorStatus !== undefined) {
+                this._publishIfNeeded(
+                    `${base}/${MQTT_TOPIC_SUFFIX_HVAC_SENSOR_STATUS}`,
+                    String(reading.sensorStatus),
+                    this.mqttOptions
+                );
+                // Degraded (out of calibration) or failed sensor → problem state
+                // for the binary_sensor (spec §25.6.12).
+                this._publishIfNeeded(
+                    `${base}/${MQTT_TOPIC_SUFFIX_HVAC_SENSOR_PROBLEM}`,
+                    reading.sensorStatus >= 2 ? MQTT_STATE_ON : MQTT_STATE_OFF,
+                    this.mqttOptions
+                );
+            }
         } else if (reading.kind === 'mode') {
             if (reading.mode !== null && reading.mode !== undefined) {
                 this._publishIfNeeded(
@@ -286,6 +318,23 @@ class EventPublisher {
                     this.mqttOptions
                 );
             }
+            // Fan speed from the Raw Level (vent/fan, evaporative-manual) as a
+            // percentage (§25.12.8), and the evaporative Comfort Level
+            // (§25.12.7) — both MQTT-only (no HA climate equivalent).
+            if (reading.fanSpeedPercent !== null && reading.fanSpeedPercent !== undefined) {
+                this._publishIfNeeded(
+                    `${base}/${MQTT_TOPIC_SUFFIX_HVAC_FAN_SPEED_PCT}`,
+                    String(reading.fanSpeedPercent),
+                    this.mqttOptions
+                );
+            }
+            if (reading.comfortLevel !== null && reading.comfortLevel !== undefined) {
+                this._publishIfNeeded(
+                    `${base}/${MQTT_TOPIC_SUFFIX_HVAC_COMFORT_LEVEL}`,
+                    String(reading.comfortLevel),
+                    this.mqttOptions
+                );
+            }
         } else if (reading.kind === 'state') {
             this._publishIfNeeded(
                 `${base}/${MQTT_TOPIC_SUFFIX_STATE}`,
@@ -312,6 +361,51 @@ class EventPublisher {
                     this.mqttOptions
                 );
             }
+            // Problem binary state for the HA binary_sensor: ON when the status
+            // error bit (§25.6.6 bit 6) or a non-zero error code says so.
+            if ((reading.error !== null && reading.error !== undefined)
+                || (reading.errorCode !== null && reading.errorCode !== undefined)) {
+                const problem = reading.error === true || (reading.errorCode || 0) > 0;
+                this._publishIfNeeded(
+                    `${base}/${MQTT_TOPIC_SUFFIX_HVAC_PROBLEM}`,
+                    problem ? MQTT_STATE_ON : MQTT_STATE_OFF,
+                    this.mqttOptions
+                );
+            }
+        } else if (reading.kind === 'humidity') {
+            // Zone humidity (spec §25.8.7, 0–100%). Null when the sensor reports
+            // total failure — surface nothing rather than a bogus reading.
+            if (reading.humidity !== null && reading.humidity !== undefined) {
+                this._publishIfNeeded(
+                    `${base}/${MQTT_TOPIC_SUFFIX_HVAC_CURRENT_HUMIDITY}`,
+                    String(reading.humidity),
+                    this.mqttOptions
+                );
+            }
+        } else if (reading.kind === 'humidity_mode') {
+            // Humidity control mode + target (spec §25.8.12). MQTT-only state;
+            // the climate entity reads these as current/target humidity.
+            if (reading.mode !== null && reading.mode !== undefined) {
+                this._publishIfNeeded(
+                    `${base}/${MQTT_TOPIC_SUFFIX_HVAC_HUMIDITY_MODE}`,
+                    reading.mode,
+                    this.mqttOptions
+                );
+            }
+            if (reading.humiditySetpoint !== null && reading.humiditySetpoint !== undefined) {
+                this._publishIfNeeded(
+                    `${base}/${MQTT_TOPIC_SUFFIX_HVAC_HUMIDITY_SETPOINT}`,
+                    String(reading.humiditySetpoint),
+                    this.mqttOptions
+                );
+            }
+        } else if (reading.kind === 'humidity_action') {
+            // Humidity plant running state (spec §25.8.5/§25.6.10).
+            this._publishIfNeeded(
+                `${base}/${MQTT_TOPIC_SUFFIX_HVAC_HUMIDITY_ACTION}`,
+                reading.action,
+                this.mqttOptions
+            );
         }
     }
 

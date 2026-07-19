@@ -15,6 +15,10 @@ const {
     MQTT_TOPIC_SUFFIX_HVAC_MODE,
     MQTT_TOPIC_SUFFIX_HVAC_FAN_MODE,
     MQTT_TOPIC_SUFFIX_HVAC_ACTION,
+    MQTT_TOPIC_SUFFIX_HVAC_CURRENT_HUMIDITY,
+    MQTT_TOPIC_SUFFIX_HVAC_HUMIDITY_SETPOINT,
+    MQTT_TOPIC_SUFFIX_HVAC_PROBLEM,
+    MQTT_TOPIC_SUFFIX_HVAC_SENSOR_PROBLEM,
     HVAC_MIN_TEMP_C,
     HVAC_MAX_TEMP_C,
     MQTT_CMD_TYPE_SWITCH,
@@ -25,6 +29,7 @@ const {
     MQTT_CMD_TYPE_TRIGGER,
     MQTT_CMD_TYPE_HVAC_SETPOINT,
     MQTT_CMD_TYPE_HVAC_MODE,
+    MQTT_CMD_TYPE_HVAC_FAN_MODE,
     MQTT_STATE_ON,
     MQTT_STATE_OFF,
     MQTT_COMMAND_STOP,
@@ -32,6 +37,7 @@ const {
     HA_COMPONENT_LIGHT,
     HA_COMPONENT_BUTTON,
     HA_COMPONENT_CLIMATE,
+    HA_COMPONENT_SENSOR,
     HA_COMPONENT_BINARY_SENSOR,
     HA_COMPONENT_SCENE,
     HA_DISCOVERY_SUFFIX,
@@ -84,6 +90,9 @@ class _HaDiscoveryPublishers {
 
     /** @type {Set<string>} */
     _nativeAirconSeen;
+
+    /** @type {Set<string>} */
+    _temperatureSeen;
 
     /** @type {Set<string>} */
     _currentRunTopics;
@@ -298,6 +307,87 @@ class _HaDiscoveryPublishers {
     }
 
     /**
+     * Event-driven discovery for C-Bus Temperature Broadcast (app 25) sensors.
+     * Called whenever a temperature reading is published for a group; announces
+     * the HA temperature sensor the first time that group is seen. Like the
+     * native aircon path, groups announce themselves on the bus — only sensors
+     * that actually broadcast get an entity.
+     *
+     * @param {string|number} network
+     * @param {string|number} appId  - temperature app id (e.g. 25)
+     * @param {string|number} group  - temperature group address
+     * @returns {boolean} true if a new sensor entity was published this call
+     */
+    ensureTemperatureDiscovery(network, appId, group) {
+        if (!this.settings.ha_discovery_enabled) return false;
+        if (network === null || network === undefined || appId === null || appId === undefined || group === null || group === undefined) return false;
+
+        const key = `${network}/${appId}/${group}`;
+        if (this._temperatureSeen.has(key)) return false;
+
+        if (this.exclude.has(key)) {
+            this.logger.debug(`Excluding temperature group ${key} from discovery`);
+            const excludedUniqueId = `cgateweb_${network}_${appId}_${group}`;
+            const excludedTopic = `${this.settings.ha_discovery_prefix}/${HA_COMPONENT_SENSOR}/${excludedUniqueId}/${HA_DISCOVERY_SUFFIX}`;
+            this._publish(excludedTopic, '', MQTT_RETAINED_STATE_OPTIONS);
+            this._publishedTopics.delete(excludedTopic);
+            this._eventDrivenDiscoveryTopics.delete(excludedTopic);
+            this._temperatureSeen.add(key); // don't re-check on every event
+            return false;
+        }
+
+        this._createTemperatureDiscovery(String(network), String(appId), String(group));
+        this._temperatureSeen.add(key);
+        return true;
+    }
+
+    /**
+     * Build and publish the temperature sensor discovery payload for one group.
+     * State comes from the app-25 temperatureDecoder reading topic
+     * (cbus/read/{net}/{app}/{group}/current_temperature, °C = byte/4).
+     *
+     * @private
+     */
+    _createTemperatureDiscovery(networkId, appId, group) {
+        const labelKey = `${networkId}/${appId}/${group}`;
+        const customLabel = this.labelMap.get(labelKey);
+        const finalLabel = customLabel || `CBus Temperature ${networkId}/${appId}/${group}`;
+        if (customLabel) this.labelStats.custom++;
+        else this.labelStats.fallback++;
+
+        const uniqueId = `cgateweb_${networkId}_${appId}_${group}`;
+        const entityId = this.entityIds.get(labelKey);
+        const area = this.areas && this.areas.get(labelKey);
+        const discoveryTopic = `${this.settings.ha_discovery_prefix}/${HA_COMPONENT_SENSOR}/${uniqueId}/${HA_DISCOVERY_SUFFIX}`;
+
+        const payload = {
+            name: null,
+            unique_id: uniqueId,
+            ...(entityId && entityIdFields(HA_COMPONENT_SENSOR, entityId)),
+
+            state_topic: `${MQTT_TOPIC_PREFIX_READ}/${networkId}/${appId}/${group}/${MQTT_TOPIC_SUFFIX_HVAC_CURRENT_TEMP}`,
+            device_class: 'temperature',
+            state_class: 'measurement',
+            unit_of_measurement: '°C', // app-25 wire format is always °C (byte/4)
+
+            qos: 0,
+            device: buildDeviceBlock({
+                identifiers: [uniqueId],
+                name: finalLabel,
+                model: 'C-Bus Temperature Sensor',
+                area
+            }),
+            origin: buildOriginBlock()
+        };
+
+        this._publish(discoveryTopic, JSON.stringify(payload), MQTT_RETAINED_STATE_OPTIONS);
+        this._publishedTopics.add(discoveryTopic);
+        this._eventDrivenDiscoveryTopics.add(discoveryTopic);
+        this.discoveryCount++;
+        this.logger.info(`Temperature sensor entity published: ${labelKey} (${finalLabel})`);
+    }
+
+    /**
      * Event-driven discovery for native C-Bus Air Conditioning (172) thermostats.
      * Called whenever an aircon reading with a source unit is decoded; publishes
      * the thermostat's HA climate entity the first time that unit is seen.
@@ -321,14 +411,14 @@ class _HaDiscoveryPublishers {
 
         if (this.exclude.has(key)) {
             this.logger.debug(`Excluding native HVAC unit ${key} from discovery`);
-            // Clear any entity published on an earlier run so it disappears from
-            // HA once the user excludes it (e.g. a PAC/controller mirroring the
-            // real thermostats).
-            const excludedUniqueId = `cgateweb_${network}_${appId}_${sourceUnit}`;
-            const excludedTopic = `${this.settings.ha_discovery_prefix}/${HA_COMPONENT_CLIMATE}/${excludedUniqueId}/${HA_DISCOVERY_SUFFIX}`;
-            this._publish(excludedTopic, '', MQTT_RETAINED_STATE_OPTIONS);
-            this._publishedTopics.delete(excludedTopic);
-            this._eventDrivenDiscoveryTopics.delete(excludedTopic);
+            // Clear any entities published on an earlier run (climate + problem
+            // sensors) so they disappear from HA once the user excludes it (e.g.
+            // a PAC/controller mirroring the real thermostats).
+            for (const topic of this._nativeAirconDiscoveryTopics(network, appId, sourceUnit)) {
+                this._publish(topic, '', MQTT_RETAINED_STATE_OPTIONS);
+                this._publishedTopics.delete(topic);
+                this._eventDrivenDiscoveryTopics.delete(topic);
+            }
             this._nativeAirconSeen.add(key); // don't re-check on every event
             return false;
         }
@@ -375,18 +465,24 @@ class _HaDiscoveryPublishers {
             temperature_state_topic: `${readBase}/${MQTT_TOPIC_SUFFIX_HVAC_SETPOINT}`,
             mode_state_topic: `${readBase}/${MQTT_TOPIC_SUFFIX_HVAC_MODE}`,
             action_topic: `${readBase}/${MQTT_TOPIC_SUFFIX_HVAC_ACTION}`,
-            // Fan mode from the Aux Level (spec §25.6.11 bit 6). Read-only state:
-            // the control path does not write the Aux Level, so no
-            // fan_mode_command_topic. HA accepts an arbitrary fan_modes list; the
-            // C-Bus values are automatic/continuous. (Raw 0-63 fan speed has no HA
-            // climate equivalent — it stays on the fan_speed MQTT topic.)
+            // Humidity state (spec-derived humidity verbs; only populated on
+            // installs with humidity plant). Read-only — no humidity writes.
+            current_humidity_topic: `${readBase}/${MQTT_TOPIC_SUFFIX_HVAC_CURRENT_HUMIDITY}`,
+            humidity_state_topic: `${readBase}/${MQTT_TOPIC_SUFFIX_HVAC_HUMIDITY_SETPOINT}`,
+            min_humidity: 0,
+            max_humidity: 100,
+            // Fan mode from the Aux Level (spec §25.6.11 bit 6). HA accepts an
+            // arbitrary fan_modes list; the C-Bus values are automatic/continuous.
+            // (Raw 0-63 fan speed has no HA climate equivalent — it stays on the
+            // fan_speed MQTT topic.)
             fan_mode_state_topic: `${readBase}/${MQTT_TOPIC_SUFFIX_HVAC_FAN_MODE}`,
             fan_modes: ['automatic', 'continuous'],
 
             // Command topics — only when control is opt-in enabled.
             ...(controlEnabled && {
                 temperature_command_topic: `${writeBase}/${MQTT_CMD_TYPE_HVAC_SETPOINT}`,
-                mode_command_topic: `${writeBase}/${MQTT_CMD_TYPE_HVAC_MODE}`
+                mode_command_topic: `${writeBase}/${MQTT_CMD_TYPE_HVAC_MODE}`,
+                fan_mode_command_topic: `${writeBase}/${MQTT_CMD_TYPE_HVAC_FAN_MODE}`
             }),
 
             // Verified against real hardware (captures 2026-06-11).
@@ -412,6 +508,62 @@ class _HaDiscoveryPublishers {
         this._eventDrivenDiscoveryTopics.add(discoveryTopic);
         this.discoveryCount++;
         this.logger.info(`Native HVAC climate entity published: ${labelKey} (${finalLabel})`);
+
+        this._createNativeAirconProblemSensors(networkId, appId, sourceUnit, uniqueId, finalLabel, area, readBase);
+    }
+
+    /**
+     * All discovery config topics belonging to one native AC thermostat
+     * (climate + problem binary_sensors) — used by the exclude path to retract
+     * every entity for the unit.
+     * @private
+     */
+    _nativeAirconDiscoveryTopics(network, appId, sourceUnit) {
+        const base = `cgateweb_${network}_${appId}_${sourceUnit}`;
+        const prefix = this.settings.ha_discovery_prefix;
+        return [
+            `${prefix}/${HA_COMPONENT_CLIMATE}/${base}/${HA_DISCOVERY_SUFFIX}`,
+            `${prefix}/${HA_COMPONENT_BINARY_SENSOR}/${base}_problem/${HA_DISCOVERY_SUFFIX}`,
+            `${prefix}/${HA_COMPONENT_BINARY_SENSOR}/${base}_sensor_problem/${HA_DISCOVERY_SUFFIX}`
+        ];
+    }
+
+    /**
+     * Publish the problem binary_sensors for one native AC thermostat: plant
+     * error (spec §25.6.6 bit 6 / §25.6.5 code) and temperature-sensor fault
+     * (§25.6.12). Both attach to the thermostat's device (same identifiers) and
+     * are read-only — published regardless of cbus_aircon_control_enabled.
+     * @private
+     */
+    _createNativeAirconProblemSensors(networkId, appId, sourceUnit, uniqueId, finalLabel, area, readBase) {
+        const definitions = [
+            { suffix: 'problem', name: 'Plant problem', stateTopic: `${readBase}/${MQTT_TOPIC_SUFFIX_HVAC_PROBLEM}` },
+            { suffix: 'sensor_problem', name: 'Temperature sensor problem', stateTopic: `${readBase}/${MQTT_TOPIC_SUFFIX_HVAC_SENSOR_PROBLEM}` }
+        ];
+        for (const def of definitions) {
+            const sensorUniqueId = `${uniqueId}_${def.suffix}`;
+            const topic = `${this.settings.ha_discovery_prefix}/${HA_COMPONENT_BINARY_SENSOR}/${sensorUniqueId}/${HA_DISCOVERY_SUFFIX}`;
+            const payload = {
+                name: def.name,
+                unique_id: sensorUniqueId,
+                device_class: 'problem',
+                state_topic: def.stateTopic,
+                payload_on: MQTT_STATE_ON,
+                payload_off: MQTT_STATE_OFF,
+                qos: 0,
+                device: buildDeviceBlock({
+                    identifiers: [uniqueId],
+                    name: finalLabel,
+                    model: 'C-Bus Air Conditioning Thermostat',
+                    area
+                }),
+                origin: buildOriginBlock()
+            };
+            this._publish(topic, JSON.stringify(payload), MQTT_RETAINED_STATE_OPTIONS);
+            this._publishedTopics.add(topic);
+            this._eventDrivenDiscoveryTopics.add(topic);
+            this.discoveryCount++;
+        }
     }
 
     /**
