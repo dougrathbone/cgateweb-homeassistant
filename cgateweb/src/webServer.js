@@ -22,6 +22,14 @@ class WebServer {
  * @param {string[]|string|null} [options.allowedOrigins] - CORS allowlist (empty disables cross-origin access)
  * @param {number} [options.maxMutationRequestsPerWindow=120] - Maximum mutating requests per minute per client
  * @param {string|null} [options.triggerAppId] - C-Bus app ID configured as trigger groups (e.g. '202')
+ * @param {Object} [options.deviceStateManager] - DeviceStateManager instance for device status endpoints
+ * @param {Object} [options.eventStream] - Event stream interface ({ subscribe, unsubscribe, getRecent }) for the SSE endpoint
+ * @param {number} [options.maxBodySizeBytes] - Maximum request body size in bytes
+ * @param {number} [options.activeDeviceWindowMs] - Window in ms for considering a device active
+ * @param {number} [options.haAreasCacheTtlMs] - Home Assistant areas cache TTL in ms
+ * @param {number} [options.haApiTimeoutMs] - Home Assistant API request timeout in ms
+ * @param {number} [options.maxSseConnections] - Maximum concurrent SSE connections
+ * @param {number} [options._sseKeepaliveMs] - SSE keep-alive interval in ms (internal)
      */
     constructor(options = {}) {
         this.port = (options.port !== null && options.port !== undefined) ? options.port : 8080;
@@ -103,7 +111,7 @@ class WebServer {
     }
 
     start() {
-        return new Promise((resolve, reject) => {
+        this._startPromise = new Promise((resolve, reject) => {
             this._server = http.createServer((req, res) => this._handleRequest(req, res));
 
             this._server.on('error', (err) => {
@@ -118,19 +126,28 @@ class WebServer {
                 resolve();
             });
         });
+        return this._startPromise;
     }
 
     close() {
-        return new Promise((resolve) => {
-            if (this._server) {
-                this._server.close(() => {
-                    this.logger.info('Web server stopped');
+        // Wait for any in-flight start() to finish binding first: calling
+        // server.close() while listen() is still pending errors with
+        // ERR_SERVER_NOT_RUNNING and the server would keep listening.
+        const started = this._startPromise || Promise.resolve();
+        return started
+            .catch(() => {
+                // A failed start leaves nothing to close.
+            })
+            .then(() => new Promise((resolve) => {
+                if (this._server) {
+                    this._server.close(() => {
+                        this.logger.info('Web server stopped');
+                        resolve();
+                    });
+                } else {
                     resolve();
-                });
-            } else {
-                resolve();
-            }
-        });
+                }
+            }));
     }
 
     /**
