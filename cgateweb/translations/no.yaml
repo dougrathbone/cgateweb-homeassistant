@@ -68,6 +68,10 @@ configuration:
     name: Seriell PCI-enhet (beta)
     description: >-
       BETA: støtte for USB-serielle PC-grensesnitt (5500PC/5500PCU) — testet med begge grensesnittene. Velg en oppdaget seriell enhet fra rullegardinlisten; foretrekk baner under /dev/serial/by-id/. For å angi en egendefinert bane, bytt konfigurasjonsredigereren til YAML-modus. Krever administrert modus og et C-Bus Toolkit-prosjekt konfigurert for et serielt PC-grensesnitt. Rapporter problemer på GitHub (sak #28).
+  cgate_external_clients:
+    name: Eksterne C-Gate-klienter
+    description: >-
+      Adresser som får koble til den administrerte C-Gate, for verktøy som C-Bus Toolkit. La stå tomt for å bare tillate dette tillegget. C-Gate har ingen autentisering, og nivået program tillater omprogrammering av C-Bus-enheter, så oppgi spesifikke adresser i stedet for et helt subnett. En oktett med verdien 255 samsvarer med enhver verdi, så 192.168.1.255 betyr hele nettverket 192.168.1.x. Du må også publisere C-Gates porter i nettverkspanelet.
   # ── MQTT (oppdages vanligvis automatisk) ──
   mqtt_host:
     name: MQTT Broker vert
@@ -320,4 +324,9 @@ configuration:
     name: Type fra etiketttprefiks
     description: >-
       Behandle en gruppeetikett som starter med et entitetsdomene-prefiks som den enhetstypen (f.eks. cover.soverom_persienne blir en cover, switch.terrasse_lys en switch). Støttede prefikser: light., cover., switch., relay., pir. En manuell type_overrides-oppføring vinner alltid. Av som standard.
+
+  ha_discovery_type_from_unit:
+    name: Type fra C-Bus-enhetstype
+    description: >-
+      Bestem typen til hver entitet ut fra C-Bus-enheten som styrer gruppen, for grupper der navnet ikke allerede identifiserer en persienne. Dimmerkanaler blir dimbare lys, relékanaler blir av/på-lys, og grupper som bare styres av en inngangsenhet som en bus coupler blir binære sensorer. En manuell type_overrides-oppføring og et navn som identifiserer en persienne (f.eks. blind, shutter) vinner fortsatt, siden et relé like gjerne kan styre et lys, en persienne eller en ventil. Grupper med ukjente enhetstyper forblir uendret. Å slå dette på kan endre typen på entiteter du allerede har.
 

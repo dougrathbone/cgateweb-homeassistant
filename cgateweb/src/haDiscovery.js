@@ -1,6 +1,6 @@
 // @ts-check
 const { createLogger } = require('./logger');
-const { findNetworkData, collectUnitGroups } = require('./haDiscoveryTree');
+const { findNetworkData, collectUnitGroups, collectUnitTypeData, networkHasUnsyncedUnits } = require('./haDiscoveryTree');
 const {
     DEFAULT_CBUS_APP_LIGHTING,
     MQTT_RETAINED_STATE_OPTIONS,
@@ -313,6 +313,8 @@ class HaDiscovery {
         } finally {
             this._labelSnapshot = null;
             this._currentRunTopics = null;
+            this._unitTypeIndex = null;
+            this._treeIncomplete = false;
         }
     }
 
@@ -349,6 +351,37 @@ class HaDiscovery {
             if (!unit) return;
             collectUnitGroups(unit, groupsByApp, targetApps);
         });
+
+        // Which unit types drive each group, so a group can be classified by its
+        // hardware instead of by its name (issues #38, #37). Run-scoped instance
+        // state, cleared in _publishDiscoveryFromTree's finally like
+        // _labelSnapshot. Only built when the feature is on — it is pure cost
+        // otherwise, and with it off the classifier ignores the index anyway.
+        if (this.settings.ha_discovery_type_from_unit) {
+            const { index, unknownTypes: unknown } = collectUnitTypeData(networkData, targetApps);
+            this._unitTypeIndex = index;
+            // This runs before the caller's own unsynced-units check (which only
+            // decides whether to schedule a re-fetch), so a mid-sync tree does
+            // reach classification. An input unit whose <Groups> has synced
+            // while the load unit's has not looks input-only, and concluding
+            // binary_sensor there retracts a real load's light config. Hold that
+            // conclusion back until the tree is complete.
+            this._treeIncomplete = networkHasUnsyncedUnits(networkData);
+
+            // Only types on units that actually drive a discovered group are
+            // reported: the message asks users to report them so they can be
+            // classified, and a unit bound to no discovered application has
+            // nothing to classify. Logging those was noise on every run
+            // (gettree refreshes included) and drew issue reports about
+            // measurement-only units and interfaces.
+            if (unknown.length) {
+                this.logger.info(
+                    `Unit types not recognised for classification on network ${networkId}: ${unknown.join(', ')}. ` +
+                    'Groups driven only by these units keep their default type. ' +
+                    'Please report them on https://github.com/dougrathbone/cgateweb/issues/37'
+                );
+            }
+        }
 
         for (const [appId, groupMap] of groupsByApp) {
             const groups = Array.from(groupMap.values());

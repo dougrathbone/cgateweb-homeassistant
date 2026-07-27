@@ -1,0 +1,424 @@
+// @ts-check
+'use strict';
+
+const nodeFs = require('fs');
+const nodePath = require('path');
+const { execFileSync } = require('child_process');
+const { backoffDelay } = require('./backoff');
+const { clampSetting } = require('./utils');
+const { defaultSettings } = require('./defaultSettings');
+
+const DEFAULT_DEVICE_FILE = '/run/cgateweb/serial-device';
+const DEFAULT_RECOVER_SCRIPT = '/usr/bin/cgateweb-recover-serial';
+
+// The recovery script's exit codes (shared with cgateweb-resolve-serial.js):
+// 1 means the device is genuinely absent, anything else non-zero is a failure
+// of the recovery itself.
+const EXIT_DEVICE_ABSENT = 1;
+
+/**
+ * Recover from a USB PC Interface that renumbered while the add-on was running
+ * (issue #28).
+ *
+ * A replugged PCI can come back on a different ttyUSBn. C-Gate keeps holding the
+ * port it opened, the network sits at InterfaceState=closed, and until now only
+ * an add-on restart fixed it. NetworkInterfaceMonitor already polls each
+ * network's interface state, so recovery hangs off that - off every offline
+ * reading, not just the transition, because the transition happens while the
+ * PCI is still out and the replug that follows changes nothing the monitor can
+ * report.
+ *
+ * Two signals distinguish a renumber from a genuine fault:
+ *   - the device path C-Gate was pointed at has vanished (a raw /dev/ttyUSBn
+ *     configuration), or
+ *   - that path still exists but now resolves to a different port (a
+ *     /dev/serial/by-id configuration, where udev recreates the same link name
+ *     over the new tty).
+ * A CNI dropout does neither — and a CNI install has no cgate_serial_device at
+ * all, so recovery is inert for it.
+ *
+ * The work itself is a rootfs script (cgateweb-recover-serial): re-resolve the
+ * device by its remembered identity, repoint every project database at the new
+ * port, then signal C-Gate so s6 restarts it. All three steps are needed;
+ * restarting the service does not re-run cont-init, so a project left naming the
+ * old port would reopen straight onto a closed interface.
+ */
+class SerialDeviceRecovery {
+    /**
+     * @param {object} deps
+     * @param {Record<string, any>} [deps.settings]
+     * @param {{info: Function, warn: Function, error: Function, debug: Function}} [deps.logger]
+     * @param {any} [deps.fsImpl] - injected for tests (existsSync/readFileSync/realpathSync)
+     * @param {(file: string, args: string[]) => {status: number, stdout?: string, stderr?: string, error?: any}} [deps.execImpl]
+     * @param {() => number} [deps.now]
+     */
+    constructor({ settings, logger, fsImpl, execImpl, now } = {}) {
+        this.settings = settings || {};
+        this.logger = logger || null;
+        this.fs = fsImpl || nodeFs;
+        this.exec = execImpl || ((file, args) => this._runScript(file, args));
+        this.now = now || Date.now;
+        /**
+         * Per-network recovery state. `reported` holds the messages already
+         * logged loudly during the current outage (see _reportOnce).
+         * @type {Map<string, {attempts: number, lastAttemptAt: number, lastUpAt: number|null, portInUse: string|null, reported: Set<string>}>}
+         */
+        this.networks = new Map();
+    }
+
+    /**
+     * @param {string} key
+     * @returns {any} The configured value, or the shipped default.
+     */
+    _setting(key) {
+        const value = this.settings[key];
+        return value === undefined || value === null ? defaultSettings[key] : value;
+    }
+
+    /**
+     * A numeric setting, clamped the way the rest of src/ clamps them.
+     *
+     * Every number this class reads gates a C-Gate restart, and a bare Number()
+     * of a mistyped option yields NaN, which fails both guards *open*:
+     * `attempts >= NaN` is false, so the cap never trips, and
+     * `now < lastAttemptAt + NaN` is false, so the backoff never waits. A single
+     * typo in one option was therefore enough to reproduce a restart-every-poll
+     * loop. clampSetting falls back to the shipped default for NaN (and for 0,
+     * which is never a sensible value for any of these) and then applies a
+     * floor, so no configuration can produce a value that disables the bound it
+     * is meant to express.
+     *
+     * @param {string} key
+     * @param {number} floor
+     * @returns {number}
+     */
+    _clampedSetting(key, floor) {
+        return clampSetting(this.settings[key], floor, defaultSettings[key]);
+    }
+
+    /** @returns {boolean} True only when a local serial PCI is in play at all. */
+    _appliesHere() {
+        if (!this.settings.cgate_serial_device) return false;
+        return String(this.settings.cgate_mode) === 'managed';
+    }
+
+    /**
+     * The device path C-Gate was actually pointed at: the one cont-init's
+     * resolver published, falling back to the configured option when the
+     * resolver never ran or could not publish. Reading the option alone would
+     * mistake a renumber cont-init already handled for a fresh one.
+     * @returns {string}
+     */
+    _effectiveDevicePath() {
+        const deviceFile = process.env.CGATEWEB_SERIAL_DEVICE_FILE || DEFAULT_DEVICE_FILE;
+        try {
+            const published = String(this.fs.readFileSync(deviceFile, 'utf8')).trim();
+            if (published) return published;
+        } catch {
+            // Not the add-on, or the resolver could not publish: use the option.
+        }
+        return String(this.settings.cgate_serial_device);
+    }
+
+    /**
+     * What a device path currently resolves to. Three answers, not two, because
+     * this gates a C-Gate restart and so has to fail closed: only ENOENT means the
+     * device is genuinely gone. ELOOP, EACCES, EIO or anything else means we
+     * cannot tell, which is not evidence of a replug and must not buy a restart.
+     * @param {string} devicePath
+     * @returns {{port: string|null, absent: boolean, reason: string|null}}
+     *          port set when it resolved; absent when it is definitely gone;
+     *          otherwise unresolved with the reason we could not look.
+     */
+    _resolvePort(devicePath) {
+        try {
+            return { port: String(this.fs.realpathSync(devicePath)), absent: false, reason: null };
+        } catch (e) {
+            const err = /** @type {any} */ (e);
+            if (err && err.code === 'ENOENT') return { port: null, absent: true, reason: null };
+            return { port: null, absent: false, reason: (err && err.message) || String(err) };
+        }
+    }
+
+    /** @param {string} networkId */
+    _stateFor(networkId) {
+        const id = String(networkId);
+        let state = this.networks.get(id);
+        if (!state) {
+            state = { attempts: 0, lastAttemptAt: 0, lastUpAt: null, portInUse: null, reported: new Set() };
+            this.networks.set(id, state);
+        }
+        return state;
+    }
+
+    /**
+     * Log an outage report at its natural level the first time it is seen, and at
+     * debug if it repeats. handleInterfaceDown runs on every poll while the
+     * interface is down (that is how a replug gets noticed), so a PC Interface
+     * left unplugged would otherwise repeat the same warning every poll for as
+     * long as it stays out. The set is cleared when the interface comes back, so
+     * the next outage says everything again.
+     * @param {{reported: Set<string>}} state
+     * @param {'info'|'warn'|'error'|'debug'} level
+     * @param {string} message
+     */
+    _reportOnce(state, level, message) {
+        const firstTimeThisOutage = !state.reported.has(message);
+        state.reported.add(message);
+        this._log(firstTimeThisOutage ? level : 'debug', message);
+    }
+
+    /**
+     * Called for every reading that shows a network's interface down - not only
+     * the transition. C-Gate reports a closed network as closed on every poll, so
+     * the transition is the one moment the PC Interface is guaranteed still to be
+     * unplugged; the replug that follows produces no transition at all. Repeats
+     * are throttled by the backoff and the attempt cap below, and their reports
+     * are deduplicated by _reportOnce.
+     * @param {string} networkId
+     * @returns {{action: 'ignored'|'reported'|'recovered'|'failed', message: string|null}}
+     */
+    handleInterfaceDown(networkId) {
+        if (!this._appliesHere()) {
+            return { action: 'ignored', message: null };
+        }
+
+        const device = this._effectiveDevicePath();
+        const state = this._stateFor(networkId);
+        const { port, absent, reason } = this._resolvePort(device);
+
+        if (port === null && !absent) {
+            // We could not read the device path at all, so we have no evidence of
+            // a renumber - and restarting C-Gate on a guess would be worse than
+            // the outage. Say so and leave it alone.
+            const unknown = `C-Bus network ${networkId} interface went down and ${device} could not be examined `
+                + `(${reason}); not treating this as a PC Interface renumber.`;
+            this._reportOnce(state, 'warn', unknown);
+            return { action: 'reported', message: unknown };
+        }
+
+        const vanished = absent;
+        // A by-id path survives a replug, so only its target moving betrays the
+        // renumber. portInUse is unknown until the interface has been seen up,
+        // in which case stay conservative and treat this as a genuine fault.
+        const moved = !vanished && state.portInUse !== null && port !== state.portInUse;
+
+        if (!vanished && !moved) {
+            this._log('debug', `C-Bus network ${networkId} interface went down but ${device} is unchanged; not a PC Interface renumber.`);
+            return { action: 'reported', message: null };
+        }
+
+        const message = vanished
+            ? `C-Bus PC Interface ${device} is no longer present (network ${networkId})`
+            : `C-Bus PC Interface ${device} now points at ${port} instead of ${state.portInUse} (network ${networkId})`;
+        this._reportOnce(state, 'warn', message);
+
+        if (this._setting('serialRecoveryEnabled') === false) {
+            return { action: 'reported', message };
+        }
+
+        // A new outage after the interface stayed up for a stable period is not
+        // the same trouble as the last one, so it gets a fresh budget. A rapid
+        // flap does not, which is what stops a loose connector restarting C-Gate
+        // indefinitely.
+        //
+        // Both conditions are measured against the last *attempt*, not against
+        // lastUpAt on its own. lastUpAt is stamped only when the interface comes
+        // up, so during an outage `now - lastUpAt` grows without bound and any
+        // interface that had been up longer than the stable window before it
+        // failed - which is every real install - would satisfy the window from
+        // the second poll onwards. That reset spent nothing and reset
+        // everything: attempts keys both the cap and the backoff, so zeroing it
+        // every poll disabled both and turned a single outage into one C-Gate
+        // restart per poll, indefinitely.
+        //
+        //   - lastUpAt >= lastAttemptAt: the interface has actually been seen up
+        //     since we last touched it. During a sustained outage it never is,
+        //     so the budget stays spent and the cap really is a cap.
+        //   - now - lastAttemptAt >= stableWindowMs: enough time has passed
+        //     since that attempt for the recovery to count as having held.
+        const now = this.now();
+        const stableWindowMs = this._clampedSetting('serialRecoveryStableWindowMs', 1000);
+        const seenUpSinceLastAttempt = state.lastUpAt !== null && state.lastUpAt >= state.lastAttemptAt;
+        if (state.attempts > 0 && seenUpSinceLastAttempt && (now - state.lastAttemptAt) >= stableWindowMs) {
+            state.attempts = 0;
+        }
+
+        const maxAttempts = this._clampedSetting('serialRecoveryMaxAttempts', 1);
+        if (state.attempts >= maxAttempts) {
+            const exhausted = `${message}. Recovery gave up after ${maxAttempts} attempt(s); `
+                + 'reconnect the PC Interface and restart the add-on.';
+            this._reportOnce(state, 'error', exhausted);
+            return { action: 'reported', message: exhausted };
+        }
+
+        // Spread repeated attempts: restarting C-Gate is disruptive, and an
+        // interface that flaps faster than it can be recovered must not turn
+        // into a restart loop.
+        if (state.attempts > 0) {
+            const waitMs = backoffDelay(state.attempts - 1, {
+                initialMs: this._clampedSetting('serialRecoveryInitialDelayMs', 1000),
+                maxMs: this._clampedSetting('serialRecoveryMaxDelayMs', 1000),
+                // No jitter: there is one local device, so there is no herd to
+                // spread, and a predictable delay is easier to read in a log.
+                jitter: false
+            });
+            const dueAt = state.lastAttemptAt + waitMs;
+            if (now < dueAt) {
+                const waiting = `${message}. Waiting ${Math.ceil((dueAt - now) / 1000)}s before the next recovery attempt `
+                    + `(${state.attempts} of ${maxAttempts} already tried).`;
+                this._reportOnce(state, 'warn', waiting);
+                return { action: 'reported', message: waiting };
+            }
+        }
+
+        state.lastAttemptAt = now;
+
+        // One script, all three steps: re-resolve, repoint the project
+        // databases, restart C-Gate.
+        const script = process.env.CGATEWEB_RECOVER_SCRIPT || DEFAULT_RECOVER_SCRIPT;
+        const result = this.exec(script, [String(this.settings.cgate_serial_device)]);
+
+        // The budget bounds C-Gate restarts, so only a run that got as far as
+        // restarting something spends it. A run that found no device resolved
+        // nothing, repointed nothing and signalled nothing: it cost the user
+        // nothing, and charging for it would burn the whole budget in a couple of
+        // minutes of polling while the interface is simply out - which is the one
+        // situation where we most need to still be looking when it comes back.
+        if (!this._deviceWasAbsent(result)) state.attempts += 1;
+
+        if (result.status !== 0) {
+            const failed = `${message}. Recovery failed: ${this._failureReason(script, result)}`;
+            this._reportOnce(state, 'error', failed);
+            return { action: 'failed', message: failed };
+        }
+
+        // The script's stderr carries the resolver's and the project fixup's
+        // narration of what moved where - worth keeping for issue triage.
+        for (const line of String(result.stderr || '').split('\n')) {
+            if (line.trim()) this._log('debug', `cgateweb-recover-serial: ${line.trim()}`);
+        }
+
+        // C-Gate is now on the port the helper just resolved, so that becomes the
+        // baseline the next "moved" test is measured against. Without this the
+        // baseline stayed at the pre-renumber port, the by-id target still looked
+        // moved on the following poll, and a C-Gate that needs longer than one
+        // poll interval to reload its project got killed again before it could
+        // finish - a self-sustaining restart loop for as long as the outage
+        // lasted. Re-resolving (rather than trusting the helper's stdout) also
+        // picks up the path the resolver has just published.
+        state.portInUse = this._resolvePort(this._effectiveDevicePath()).port;
+
+        const newPath = String(result.stdout || '').trim().split('\n').pop();
+        const recovered = `Re-resolved the PC Interface to ${newPath}, repointed the project and restarted C-Gate `
+            + `to reopen network ${networkId}`;
+        this._log('warn', recovered);
+        return { action: 'recovered', message: recovered };
+    }
+
+    /**
+     * Called when a network's interface comes back. Records the port C-Gate is
+     * now running on (the baseline a later renumber is measured against) and
+     * when it came up (which decides whether the next outage gets a fresh
+     * attempt budget).
+     * @param {string} networkId
+     */
+    handleInterfaceUp(networkId) {
+        if (!this._appliesHere()) return;
+        const state = this._stateFor(networkId);
+        state.lastUpAt = this.now();
+        // The outage is over, so its reports may all be said again next time.
+        state.reported.clear();
+        // null (gone, or unreadable) leaves portInUse unknown, which is what makes
+        // the "moved" check below decline rather than guess.
+        state.portInUse = this._resolvePort(this._effectiveDevicePath()).port;
+        if (state.attempts > 0) {
+            this._log('info', `C-Bus network ${networkId} interface is back on ${state.portInUse} `
+                + `after ${state.attempts} recovery attempt(s).`);
+        }
+    }
+
+    /**
+     * True when the helper reported the device simply absent: it exits with
+     * EXIT_DEVICE_ABSENT before touching a project database or C-Gate, so nothing
+     * was restarted. A helper that could not be spawned or that timed out
+     * surfaces as the same status (execFileSync has no exit code to report there),
+     * but it is a broken install rather than an absent device and must be allowed
+     * to exhaust the budget instead of retrying every poll forever - hence the
+     * errno check.
+     * @param {{status: number, error?: any}} result
+     * @returns {boolean}
+     */
+    _deviceWasAbsent(result) {
+        if (result.status !== EXIT_DEVICE_ABSENT) return false;
+        return !(result.error && result.error.code);
+    }
+
+    /**
+     * @param {string} script
+     * @param {{status: number, stdout?: string, stderr?: string, error?: any}} result
+     * @returns {string}
+     */
+    _failureReason(script, result) {
+        if (result.error && result.error.code === 'ENOENT') {
+            return `the recovery helper ${script} is not installed (it ships with the Home Assistant add-on)`;
+        }
+        if (result.error && result.error.code === 'ETIMEDOUT') {
+            return `the recovery helper ${script} timed out`;
+        }
+        // The script tags its lines WARN:/INFO:; the last one is the verdict.
+        const lines = String(result.stderr || '').split('\n').map(l => l.trim()).filter(Boolean);
+        if (lines.length) return lines[lines.length - 1];
+        return result.status === EXIT_DEVICE_ABSENT
+            ? 'the PC Interface could not be found under any name'
+            : `${nodePath.basename(script)} exited ${result.status}`;
+    }
+
+    /**
+     * How long the helper may run. Clamped because execFileSync reads a timeout of
+     * 0 as "no timeout at all", which would let a wedged helper block the bridge's
+     * event loop for good - the opposite of what this bound is for.
+     * @returns {number}
+     */
+    _timeoutMs() {
+        return this._clampedSetting('serialRecoveryTimeoutMs', 1000);
+    }
+
+    /**
+     * Default child-process runner. Synchronous on purpose: recovery is a rare,
+     * ordered sequence (resolve, repoint, restart) and the bridge has nothing
+     * useful to do until C-Gate is back. The timeout is what keeps a wedged
+     * helper from wedging the bridge with it.
+     * @param {string} file
+     * @param {string[]} args
+     * @returns {{status: number, stdout: string, stderr: string, error?: any}}
+     */
+    _runScript(file, args) {
+        try {
+            const stdout = execFileSync(file, args, {
+                encoding: 'utf8',
+                timeout: this._timeoutMs(),
+                stdio: ['ignore', 'pipe', 'pipe']
+            });
+            return { status: 0, stdout, stderr: '' };
+        } catch (e) {
+            const err = /** @type {any} */ (e);
+            return {
+                status: typeof err.status === 'number' ? err.status : 1,
+                stdout: String(err.stdout || ''),
+                stderr: String(err.stderr || ''),
+                error: err
+            };
+        }
+    }
+
+    /**
+     * @param {'info'|'warn'|'error'|'debug'} level
+     * @param {string} message
+     */
+    _log(level, message) {
+        if (this.logger && typeof this.logger[level] === 'function') this.logger[level](message);
+    }
+}
+
+module.exports = SerialDeviceRecovery;

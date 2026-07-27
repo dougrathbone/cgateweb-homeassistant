@@ -14,7 +14,33 @@ CGATEWEB_DEFAULT_DOWNLOAD_URL="https://download.se.com/files?p_Doc_Ref=C-Gate_3_
 # containing cgate-3.3.2_1855.zip). Downloads from the default URL are verified
 # against this; a user-set cgate_download_sha256 overrides it — the escape
 # hatch if Schneider re-releases the zip and this pin goes stale.
-CGATEWEB_DEFAULT_DOWNLOAD_SHA256="b6a3f8b8e722b239c0974036ab316d8ec7e1c74ad8d9976a08dbcdec9a43948c"
+#
+# Re-pinned 2026-07-27: Schneider repackaged the outer zip on 2026-07-24, which
+# broke every new managed-mode install because the download no longer matched.
+# The inner payload is byte-for-byte the same C-Gate — still cgate-3.3.2_1855.zip
+# — and the bundled release-notes PDF came back named "C-Gate 3 Release Notes
+# (3).pdf", a browser download-collision suffix, so this was a manual re-zip
+# rather than a new C-Gate build. Expect it to recur: the escape hatch above is
+# the supported answer for users, and this constant is the fix for everyone else.
+CGATEWEB_DEFAULT_DOWNLOAD_SHA256="1d871bcd38355234a3b5b30a208463c8be079aa9346152476f2209f516cf271d"
+
+# The identity-aware serial resolver (issue #28) and the file it publishes its
+# answer to. Both are overridable so the unit tests can run the repo copy of
+# the resolver and keep its bookkeeping out of /run.
+CGATEWEB_RESOLVE_SERIAL_JS="${CGATEWEB_RESOLVE_SERIAL_JS:-/usr/bin/cgateweb-resolve-serial.js}"
+# The default device-file path is defined once in the shared helper also
+# sourced by cgate-project-sync.sh and cgateweb-serial-diagnostics, so all
+# three boot scripts agree on it without each inlining their own copy.
+CGATEWEB_SERIAL_DEVICE_LIB="${CGATEWEB_SERIAL_DEVICE_LIB:-/usr/lib/cgateweb/serial-device.sh}"
+# The path is a variable so tests can point at the repo copy, so this is
+# SC1090 ("can't follow non-constant source"), not SC1091 ("file not found").
+# The helper is linted directly by CI, so nothing is lost by not following it.
+# shellcheck disable=SC1090
+source "${CGATEWEB_SERIAL_DEVICE_LIB}"
+# Exported so the resolver child process writes the very file this script (and
+# the boot scripts after it) reads back, rather than each falling back to its
+# own default independently.
+export CGATEWEB_SERIAL_DEVICE_FILE="${CGATEWEB_SERIAL_DEVICE_FILE:-${CGATEWEB_SERIAL_DEVICE_DEFAULT_FILE}}"
 
 # bashio::config returns the literal string "null" for unset optional fields,
 # even when an empty default is passed (upstream bashio's `${2:-null}` rewrites
@@ -158,6 +184,15 @@ _cgateweb_upload_zip_is_newer() {
     if [[ ! -e "${marker}" || "${zip}" -nt "${marker}" ]]; then printf '1'; else printf '0'; fi
 }
 
+# The dead end both serial-resolution paths share: the configured device is
+# not there and nothing could stand in for it. Says where to find the real
+# path rather than just naming the one that failed.
+_cgateweb_serial_device_not_found() {
+    bashio::log.error "Serial device not found: $1"
+    bashio::log.error "Find the real path in Home Assistant: Settings > System > Hardware > ⋮ (top right) > All hardware"
+    bashio::log.error "Look for /dev/ttyUSB* or /dev/ttyACM*; prefer the stable /dev/serial/by-id/ path"
+}
+
 # ─── ALPHA: USB-serial PCI passthrough (issue #28) ─────────────────────────
 # Validate the opt-in cgate_serial_device option. The option is deliberately
 # absent from `options` in config.yaml, so it is unset for every existing user
@@ -201,22 +236,107 @@ _cgateweb_check_serial_device() {
         bashio::log.info "No /dev/ttyUSB* or /dev/ttyACM* devices found and no /dev/serial/by-id/ directory — is the PCI plugged in?"
     fi
 
-    if [[ ! -e "${device}" ]]; then
-        bashio::log.error "Serial device not found: ${device}"
-        bashio::log.error "Find the real path in Home Assistant: Settings > System > Hardware > ⋮ (top right) > All hardware"
-        bashio::log.error "Look for /dev/ttyUSB* or /dev/ttyACM*; prefer the stable /dev/serial/by-id/ path"
-        return 1
+    # Turn the configured path into a live one. A PC Interface that is
+    # unplugged and replugged can come back as a different ttyUSBn (issue #28),
+    # so the resolver falls back to the identity recorded on the last good boot
+    # instead of failing on a path that no longer exists. It prints the chosen
+    # path on stdout and its diagnostics on stderr; the two streams are captured
+    # separately so the answer never depends on how Node happened to interleave
+    # them, and the diagnostics are replayed through bashio so they reach the
+    # add-on log with a level prefix.
+    local resolved
+    if command -v node >/dev/null 2>&1; then
+        # Node exits 1 for its own failures too — a missing or unreadable
+        # script after a packaging slip, or a module load error — and the
+        # exit-code contract below reads 1 as "the device is not there". Check
+        # the script up front so a broken image is named as a broken image
+        # instead of sending the user hunting for hardware that never moved.
+        if [[ ! -r "${CGATEWEB_RESOLVE_SERIAL_JS}" ]]; then
+            bashio::log.error "The serial device resolver is missing or unreadable: ${CGATEWEB_RESOLVE_SERIAL_JS}"
+            bashio::log.error "This is a broken add-on image, not a missing device — your ${device} was not checked at all"
+            bashio::log.error "Reinstall or update the add-on; if it persists, report it on https://github.com/dougrathbone/cgateweb/issues/28"
+            return 1
+        fi
+
+        # Kept in the temp dir rather than beside the device file: a device
+        # file the add-on cannot write is a warning below, not a reason to lose
+        # the resolver's diagnostics or fail startup.
+        local err_file resolver_status=0
+        err_file=$(mktemp "${TMPDIR:-/tmp}/cgateweb-resolve-serial.XXXXXX")
+        resolved=$(node "${CGATEWEB_RESOLVE_SERIAL_JS}" "${device}" 2>"${err_file}") || resolver_status=$?
+        # The resolver tags each diagnostic with the level it deserves: advice
+        # ("prefer the stable by-id path") is not a warning. Anything untagged
+        # is unexpected output — a node crash, say — so it warns.
+        # `|| [[ -n ... ]]` keeps a final line with no trailing newline.
+        while IFS= read -r line || [[ -n "${line}" ]]; do
+            case "${line}" in
+                '')       ;;
+                'INFO: '*) bashio::log.info "${line#INFO: }" ;;
+                'WARN: '*) bashio::log.warning "${line#WARN: }" ;;
+                *)        bashio::log.warning "${line}" ;;
+            esac
+        done < "${err_file}"
+        rm -f "${err_file}"
+        # Exit 1 means the device genuinely is not there; anything else means
+        # the resolver failed for its own reasons (it exits 2 when it recovered
+        # a new path but could not publish it). Reporting both as "device not
+        # found" sent users hunting for a device that was plugged in the whole
+        # time. The readability check above covers the other way node itself
+        # produces a 1 — a missing or unreadable script.
+        if [[ ${resolver_status} -eq 1 ]]; then
+            _cgateweb_serial_device_not_found "${device}"
+            return 1
+        elif [[ ${resolver_status} -ne 0 ]]; then
+            bashio::log.error "Could not determine which serial device to use (resolver exited ${resolver_status}) — see the messages above"
+            return 1
+        fi
+    else
+        # No node means no resolver and no recovery from a renumber; fall back
+        # to the plain existence check used before issue #28, which is correct
+        # whenever the device has not moved.
+        bashio::log.warning "node is unavailable — checking ${device} directly, without identity-based recovery"
+        if [[ ! -e "${device}" ]]; then
+            _cgateweb_serial_device_not_found "${device}"
+            return 1
+        fi
+        resolved="${device}"
+    fi
+
+    # Publish the agreed path. cgate-project-sync.sh and the serial diagnostics
+    # read this file instead of re-resolving cgate_serial_device themselves: a
+    # second resolution can disagree with this one if the device renumbers in
+    # between, which is how the install check could pass while the project
+    # fixup wrote a port name that no longer existed.
+    #
+    # The resolver already wrote the file whenever it could, so this write
+    # covers the node-less fallback above and re-affirms the file otherwise.
+    # It can still fail: the resolver returns success (rather than aborting
+    # startup) when the file is unwritable but the path it resolved is the
+    # configured one, because the consumers' fallback to cgate_serial_device
+    # then yields exactly the same answer. That is the only way to reach the
+    # warning below with node present — a resolved path that *differs* from the
+    # configured one and cannot be published has already exited non-zero above.
+    mkdir -p "${CGATEWEB_SERIAL_DEVICE_FILE%/*}" 2>/dev/null
+    if ! { printf '%s' "${resolved}" > "${CGATEWEB_SERIAL_DEVICE_FILE}"; } 2>/dev/null; then
+        bashio::log.warning "Could not record the resolved serial device in ${CGATEWEB_SERIAL_DEVICE_FILE} — later steps will re-read cgate_serial_device (${device}), which is the same path"
     fi
 
     # Show the selected device's details and resolve symlinks so a
     # /dev/serial/by-id/ path also logs its real target (e.g. ../../ttyUSB0).
-    bashio::log.info "Selected device: $(ls -l "${device}" 2>/dev/null)"
-    local resolved
-    resolved=$(readlink -f "${device}" 2>/dev/null || printf '%s' "${device}")
-    bashio::log.info "Serial device ${device} resolves to ${resolved}"
+    bashio::log.info "Selected device: $(ls -l "${resolved}" 2>/dev/null)"
+    # Only the configured path and the resolved path are related by
+    # configuration; the readlink target belongs to the resolved path alone.
+    # Pairing "${device} resolves to ${target}" after a recovery read as a
+    # symlink relationship that does not exist.
+    if [[ "${resolved}" != "${device}" ]]; then
+        bashio::log.info "Resolved to a different device: ${resolved} (the configured ${device} renumbered)"
+    fi
+    local target
+    target=$(readlink -f "${resolved}" 2>/dev/null || printf '%s' "${resolved}")
+    bashio::log.info "Serial device ${resolved} resolves to ${target}"
 
-    if [[ ! -c "${device}" ]]; then
-        bashio::log.warning "${device} exists but is not a character device — C-Gate may fail to open it"
+    if [[ ! -c "${resolved}" ]]; then
+        bashio::log.warning "${resolved} exists but is not a character device — C-Gate may fail to open it"
     fi
 
     # A local serial device is only meaningful when C-Gate runs inside this
@@ -231,6 +351,367 @@ _cgateweb_check_serial_device() {
 
     bashio::log.info "USB-serial PCI: your C-Bus Toolkit project (.db) must define a serial PC Interface for the network"
     bashio::log.info "Projects saved on Windows reference a COMx port — the project sync will rewrite it to this device automatically"
+    return 0
+}
+
+# ─── C-Gate access control ─────────────────────────────────────────────────
+# Markers delimiting the block this script owns. Anything outside them is the
+# user's and is preserved across boots.
+CGATEWEB_ACCESS_BEGIN='# >>> cgateweb managed block - do not edit <<<'
+CGATEWEB_ACCESS_END='# <<< cgateweb managed block >>>'
+
+# One "remote <address> <level>" line per configured external client, or
+# nothing when the list is empty. Split out so it can be stubbed in tests
+# without depending on bashio's list flattening.
+_cgateweb_external_client_rules() {
+    local count
+    count=$(bashio::config 'cgate_external_clients|length' '0')
+    [[ "${count}" =~ ^[0-9]+$ ]] || count=0
+
+    local i address level
+    for ((i = 0; i < count; i++)); do
+        address=$(bashio::config "cgate_external_clients[${i}].address" '')
+        level=$(bashio::config "cgate_external_clients[${i}].level" '')
+
+        # A blank address used to be skipped silently, so a user who added a row
+        # and left the address empty got no rule and no message, and would
+        # believe external access had been granted. Fail like the level check
+        # below does, naming which entry is at fault.
+        if [[ -z "${address}" || "${address}" == "null" ]]; then
+            bashio::log.error "Missing address for cgate_external_clients entry ${i} (the first entry is 0); set the client's IP address or hostname, or remove the entry"
+            return 1
+        fi
+
+        # A newline embedded in the option value (a copy-paste slip, say)
+        # would otherwise split the printf below into two lines, each read
+        # and validated independently by the caller as its own `remote`
+        # rule the user never authored. No privilege escalation results --
+        # the emitted keyword is always the literal "remote" regardless of
+        # what a split line parses as -- but it is still an unintended rule.
+        # Reject any whitespace in the address outright instead.
+        if [[ "${address}" =~ [[:space:]] ]]; then
+            bashio::log.error "Invalid address in cgate_external_clients: contains whitespace (check for an embedded newline)"
+            return 1
+        fi
+
+        # Unreachable through the HA UI today (the schema's level field is a
+        # required list()), but a hand-edited options.json could still hit
+        # this. Fail loud like every other invalid level rather than
+        # silently downgrading to monitor.
+        if [[ -z "${level}" || "${level}" == "null" ]]; then
+            bashio::log.error "Missing level for cgate_external_clients address '${address}'; use monitor, operate or program"
+            return 1
+        fi
+
+        printf 'remote %s %s\n' "${address}" "${level}"
+    done
+}
+
+# Given a dotted-quad IPv4 address, echoes the "meaning" of any wildcard (255)
+# octets with each replaced by 'x' -- e.g. "192.168.1.255" -> "192.168.1.x" --
+# since an octet of 255 in a `remote` rule matches any value in that position
+# (manual 4.10.1). Echoes nothing when the address is not a 4-octet dotted
+# form, or has no 255 octet (nothing to warn about).
+_cgateweb_ipv4_wildcard_meaning() {
+    local address="$1"
+    [[ "${address}" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]] || return 0
+
+    local o1 o2 o3 o4
+    IFS='.' read -r o1 o2 o3 o4 <<< "${address}"
+
+    local has_wildcard=0
+    [[ "${o1}" == "255" ]] && { o1='x'; has_wildcard=1; }
+    [[ "${o2}" == "255" ]] && { o2='x'; has_wildcard=1; }
+    [[ "${o3}" == "255" ]] && { o3='x'; has_wildcard=1; }
+    [[ "${o4}" == "255" ]] && { o4='x'; has_wildcard=1; }
+    [[ ${has_wildcard} -eq 1 ]] || return 0
+
+    printf '%s.%s.%s.%s' "${o1}" "${o2}" "${o3}" "${o4}"
+}
+
+# Write C-Gate's access control file (manual 4.10.1).
+#
+# The grammar is `<keyword> <address> <level>` with exactly three keywords:
+# interface (the server NIC a connection arrives on), remote (the connecting
+# client's address), and user. Levels, increasing, are none, connect, monitor,
+# operate, admin, program, debug. Faulty lines are silently ignored.
+#
+# The C-Gate distribution zip ships its own config/access.txt, and the install
+# step above (`cp -r "${EXTRACTED_DIR}"/* "${CGATE_DIR}/"`) always copies it
+# onto disk, so managed installs have never actually run with an empty access
+# list. The stock file grants `interface`-level Program to the IPv4 and IPv6
+# loopback NICs:
+#   interface 0:0:0:0:0:0:0:1 Program
+#   interface 127.0.0.1 Program
+#   interface localhost Program
+# (An earlier version of this comment claimed a "only if the file is missing"
+# guard left managed installs relying on a malformed, effectively-empty access
+# list. That guard — `if [[ ! -f "${ACCESS_FILE}" ]]` — was always false
+# because the stock file above already existed by the time it ran, so the
+# malformed heredoc it guarded never actually executed. That claim was wrong
+# and is corrected here.)
+#
+# This function adds an explicit, correctly-formed `remote` block scoped to
+# the add-on's own loopback connection on top of — not instead of — that
+# stock grant; the stock lines are preserved untouched outside the managed
+# block below. It deliberately never emits an `interface` rule itself: unlike
+# `remote`, an interface rule matches every connection arriving on the NIC it
+# names, so one intended as a per-client grant silently becomes a blanket
+# grant for everything on that NIC. The three awk patterns below that strip
+# bare `interface 127.0.0.1` / `program 127.0.0.1` / `monitor 127.0.0.1`
+# lines (level names used as keywords, which C-Gate silently ignores) are
+# defensive cleanup for any C-Gate release whose zip omits the stock
+# access.txt, or an install this script mis-wrote before this fix — not the
+# common case.
+#
+# Report a failed rewrite and decide whether it should stop the boot.
+#
+# An install that already has an access control file keeps working with the one
+# it has: C-Gate reads that file, not this function's intentions. A cont-init
+# script returning non-zero stops the add-on from starting altogether, and
+# 1.17.6 did nothing at all when the file already existed — so failing the boot
+# to add a rule to a file that is already granting the add-on access trades a
+# working system for a broken one. Warn and carry on instead, the same
+# deliberate choice the serial path makes when it cannot publish its resolved
+# device. Only a fresh install with no file to fall back on is fatal.
+#
+# The diagnosis is chosen here rather than at each call site because an
+# unwritable directory makes every step fail, and reporting that as "the
+# existing file could not be parsed" sent people examining the contents of a
+# file that was perfectly fine.
+_cgateweb_access_rewrite_failed() {
+    local access_file="$1"
+    local detail="$2"
+    local dir
+    dir=$(dirname "${access_file}")
+
+    local diagnosis="${detail}"
+    if [[ ! -w "${dir}" ]]; then
+        diagnosis="the directory ${dir} is not writable"
+    fi
+
+    if [[ -f "${access_file}" ]]; then
+        bashio::log.warning "Could not update the C-Gate access control file: ${diagnosis}"
+        bashio::log.warning "Keeping the existing ${access_file}; C-Gate will start with the access rules already in it"
+        if [[ -n "${CGATE_EXTERNAL_CLIENTS_CONFIGURED:-}" ]]; then
+            bashio::log.warning "Any cgate_external_clients rules you configured are NOT active until this file can be written"
+        fi
+        return 0
+    fi
+
+    bashio::log.error "Failed to write the C-Gate access control file ${access_file}: ${diagnosis}"
+    return 1
+}
+
+_cgateweb_write_access_control() {
+    local access_file="$1"
+    local dir
+    dir=$(dirname "${access_file}")
+
+    if ! mkdir -p "${dir}" 2>/dev/null; then
+        bashio::log.error "Could not create directory for C-Gate access control file: ${dir}"
+        return 1
+    fi
+
+    if [[ -d "${access_file}" ]]; then
+        bashio::log.error "C-Gate access control path is a directory, not a file: ${access_file}"
+        return 1
+    fi
+
+    # cgateweb and managed C-Gate share this container, so the bridge connects
+    # from loopback. `program` is not required by anything cgateweb itself
+    # does: C-Gate loads and starts the project from project.start in
+    # C-GateConfig.txt, not over an access-controlled client connection.
+    # cgateweb's own traffic (TREEXML, GET, ON/OFF/RAMP, EVENT ON, LOGIN) only
+    # ever needs `operate` (`monitor` is enough on the event port). `program`
+    # is kept here because it matches the stock access.txt's own loopback
+    # grant (see the block comment above) rather than narrowing it — the
+    # container runs with host_network: false, so the blast radius of that
+    # extra headroom is nil.
+    local -a rules=(
+        "remote 127.0.0.1 program"
+        "remote 0:0:0:0:0:0:0:1 program"
+    )
+
+    # External clients (issue #37): C-Gate is a multi-client server, so Toolkit
+    # and friends connect to it directly rather than sharing the serial port.
+    # Validate here so a typo fails cont-init with a readable error instead of
+    # being silently dropped by C-Gate.
+    #
+    # Captured via command substitution (not process substitution) so this
+    # function's own exit status is visible: _cgateweb_external_client_rules
+    # can now fail (e.g. MINOR 2/3 below) and that failure must abort
+    # cont-init rather than being silently swallowed by a background reader.
+    local external_rules external_rules_status=0
+    external_rules=$(_cgateweb_external_client_rules) || external_rules_status=$?
+    if [[ ${external_rules_status} -ne 0 ]]; then
+        bashio::log.error "Failed to read cgate_external_clients -- see the message above"
+        return 1
+    fi
+
+    local line keyword address level extra wildcard_meaning
+    while IFS= read -r line; do
+        [[ -z "${line}" ]] && continue
+        # `read` splits on whitespace without performing pathname expansion,
+        # unlike the unquoted `set -- ${line}` this replaced: that let a glob
+        # character in a hand-typed address (e.g. an address of "et?" with
+        # cwd "/") expand against the filesystem before validation ever saw
+        # it. A 4th field (extra) catches entries with too many words.
+        read -r keyword address level extra <<< "${line}"
+        if [[ -z "${keyword}" || -z "${address}" || -z "${level}" || -n "${extra}" ]]; then
+            bashio::log.error "Invalid cgate_external_clients entry: '${line}'"
+            return 1
+        fi
+        if [[ "${address}" == "255.255.255.255" ]]; then
+            bashio::log.error "Invalid address in cgate_external_clients: '255.255.255.255'"
+            bashio::log.error "Every octet of 255 matches any value, so this grants every address on the internet -- narrow it to the specific address or subnet you intend to allow."
+            return 1
+        fi
+        if [[ ! "${address}" =~ ^[A-Za-z0-9_.:-]+$ ]]; then
+            bashio::log.error "Invalid address in cgate_external_clients: '${address}'"
+            bashio::log.error "Use an IP address or hostname. An octet of 255 matches any value, e.g. 192.168.1.255 for the whole subnet."
+            return 1
+        fi
+        case "${level}" in
+            monitor|operate|program) ;;
+            *)
+                bashio::log.error "Invalid level '${level}' for ${address}; use monitor, operate or program"
+                return 1
+                ;;
+        esac
+        wildcard_meaning=$(_cgateweb_ipv4_wildcard_meaning "${address}")
+        if [[ -n "${wildcard_meaning}" ]]; then
+            bashio::log.warning "C-Gate address ${address} grants every address on ${wildcard_meaning} (an octet of 255 matches any value)"
+        fi
+        rules+=("remote ${address} ${level}")
+        bashio::log.warning "C-Gate access granted to ${address} at ${level} level"
+    done <<< "${external_rules}"
+
+    if [[ ${#rules[@]} -gt 2 ]]; then
+        bashio::log.warning "C-Gate has no authentication on its command ports; only publish them if you need external access"
+        # Deliberately not `local`: _cgateweb_access_rewrite_failed reads it to
+        # warn that configured external rules are not active if the write fails.
+        CGATE_EXTERNAL_CLIENTS_CONFIGURED=1
+    fi
+
+    # Cleaned up on every return from this function (success or failure) via
+    # the RETURN trap below, so a failed rewrite never leaves a stray .tmp or
+    # awk-stderr file behind. The trap clears itself (`trap - RETURN`) as its
+    # last act: a RETURN trap set inside a function also fires again when an
+    # enclosing `source` of this whole script finishes (a real bash quirk,
+    # not just a function-to-function call) — at which point the local
+    # variables it references no longer exist. Self-clearing means it only
+    # ever fires once, for this function's own return.
+    local tmp_file="${access_file}.tmp"
+    # The awk stderr capture lives in the temp dir, not beside the access file.
+    # Inside the target directory it turned an unwritable config directory into
+    # a phantom parse failure: the shell could not create the redirection
+    # target, reported its own raw "Permission denied" outside bashio's log
+    # formatting, and failed the command substitution before awk ever ran — so
+    # the diagnosis blamed the contents of a file that had not been read. Same
+    # reasoning, and the same TMPDIR convention, as the resolver's err_file.
+    local awk_err_file=""
+    if ! awk_err_file=$(mktemp "${TMPDIR:-/tmp}/cgateweb-access-awkerr.XXXXXX" 2>/dev/null); then
+        awk_err_file=""
+        bashio::log.warning "Could not create a temporary file for access-control diagnostics; continuing without them"
+    fi
+    trap 'rm -f "${tmp_file}"; [[ -z "${awk_err_file}" ]] || rm -f "${awk_err_file}"; trap - RETURN' RETURN
+
+    # Stop here when the directory cannot be written: every step below would
+    # fail, and the shell reports a failed redirection itself, in raw bash form,
+    # outside bashio. Checked after the cgate_external_clients validation above
+    # so a typo in that option is still reported loudly rather than being
+    # skipped along with the write. mkdir -p does not catch this — it succeeds
+    # for a directory that already exists, whatever its permissions.
+    if [[ ! -w "${dir}" ]]; then
+        _cgateweb_access_rewrite_failed "${access_file}" "the directory ${dir} is not writable"
+        return $?
+    fi
+
+    local preserved=""
+    if [[ -f "${access_file}" ]]; then
+        if [[ ! -r "${access_file}" ]]; then
+            _cgateweb_access_rewrite_failed "${access_file}" "the existing file cannot be read"
+            return $?
+        fi
+
+        # Keep everything outside our markers; drop the old block and any
+        # pre-marker lines this script previously generated. Marker
+        # comparison trims trailing whitespace and a trailing \r before
+        # comparing, so a hand-edited or Windows-saved file (CRLF endings)
+        # still resolves to a single managed block instead of growing a
+        # second, stale one that stays live because C-Gate's Java readLine()
+        # strips \r but awk's exact-match comparison would not. An orphaned
+        # begin marker (no matching end — a hand-mangled file) preserves
+        # everything after it instead of silently deleting it; a warning is
+        # logged below when that happens.
+        if ! preserved=$(awk -v b="${CGATEWEB_ACCESS_BEGIN}" -v e="${CGATEWEB_ACCESS_END}" '
+            function norm(s) { sub(/\r$/, "", s); sub(/[ \t]+$/, "", s); return s }
+            {
+                marker = norm($0)
+            }
+            inblock && marker == e { inblock = 0; buffered = 0; next }
+            marker == b { inblock = 1; buffered = 0; next }
+            inblock {
+                buffered++
+                buf[buffered] = $0
+                next
+            }
+            /^interface 127\.0\.0\.1$/ { next }
+            /^program 127\.0\.0\.1$/   { next }
+            /^monitor 127\.0\.0\.1$/   { next }
+            { print }
+            END {
+                if (inblock) {
+                    for (i = 1; i <= buffered; i++) print buf[i]
+                    print "orphaned begin marker" > "/dev/stderr"
+                }
+            }
+        ' "${access_file}" 2>"${awk_err_file:-/dev/null}"); then
+            _cgateweb_access_rewrite_failed "${access_file}" "the existing file could not be parsed"
+            return $?
+        fi
+        if [[ -n "${awk_err_file}" && -s "${awk_err_file}" ]]; then
+            bashio::log.warning "C-Gate access control file ${access_file} had an orphaned managed-block begin marker with no matching end — preserving the content after it instead of discarding it"
+        fi
+    else
+        preserved="# C-Gate Access Control
+# Lines outside the cgateweb block below are preserved across restarts."
+    fi
+
+    # Two things about this redirection, both verified against bash 5.3 as a
+    # non-root user:
+    #
+    #   - `2>/dev/null` precedes the stdout redirection deliberately.
+    #     Redirections are applied left to right, so stderr is already discarded
+    #     by the time bash tries to create tmp_file, which keeps the shell's own
+    #     raw "Permission denied" out of the add-on log. The diagnosis comes from
+    #     _cgateweb_access_rewrite_failed instead.
+    #   - the status is captured with `|| write_status=$?` rather than tested by
+    #     wrapping the group in `if ! ...`. A redirection that fails to open its
+    #     target does set a non-zero status for the group, but that status is
+    #     swallowed when the group is the condition of an `if !`, so the guard
+    #     this replaced could never fire; the failure only surfaced at the `mv`
+    #     below, one step later and with a misleading message.
+    local write_status=0
+    {
+        printf '%s\n' "${preserved}"
+        printf '%s\n' "${CGATEWEB_ACCESS_BEGIN}"
+        local rule
+        for rule in "${rules[@]}"; do printf '%s\n' "${rule}"; done
+        printf '%s\n' "${CGATEWEB_ACCESS_END}"
+    } 2>/dev/null > "${tmp_file}" || write_status=$?
+    if [[ ${write_status} -ne 0 ]]; then
+        _cgateweb_access_rewrite_failed "${access_file}" "the temporary file ${tmp_file} could not be written"
+        return $?
+    fi
+
+    if ! mv "${tmp_file}" "${access_file}" 2>/dev/null; then
+        _cgateweb_access_rewrite_failed "${access_file}" "the new file could not be moved into place"
+        return $?
+    fi
+
+    bashio::log.info "Wrote C-Gate access control (${#rules[@]} rule(s))"
     return 0
 }
 
@@ -256,7 +737,11 @@ if [[ "${CGATE_MODE}" != "managed" ]]; then
     exit 0
 fi
 
-CGATE_DIR="/data/cgate"
+# Overridable so tests can point the whole install flow at a temp dir instead
+# of the real /data/cgate, the same test-seam pattern used by
+# CGATEWEB_SERIAL_DEVICE_FILE above. Unset in production, so this always
+# resolves to /data/cgate there.
+CGATE_DIR="${CGATE_DIR:-/data/cgate}"
 CGATE_JAR="${CGATE_DIR}/cgate.jar"
 INSTALL_SOURCE=$(bashio::config 'cgate_install_source' 'download')
 DOWNLOAD_SHA256=$(_cgateweb_resolve_download_sha256)
@@ -539,18 +1024,12 @@ fi
 
 fi  # end NEED_INSTALL
 
-# Configure access.txt to allow local connections
+# Configure access.txt. Runs on every boot, not only when the file is absent,
+# so the grammar fix and any configured external clients reach existing installs.
 ACCESS_FILE="${CGATE_DIR}/config/access.txt"
-if [[ ! -f "${ACCESS_FILE}" ]]; then
-    mkdir -p "${CGATE_DIR}/config"
-    cat > "${ACCESS_FILE}" << 'ACCESSEOF'
-# C-Gate Access Control
-# Allow local connections from the addon
-interface 127.0.0.1
-program 127.0.0.1
-monitor 127.0.0.1
-ACCESSEOF
-    bashio::log.info "Created default access.txt"
+if ! _cgateweb_write_access_control "${ACCESS_FILE}"; then
+    bashio::log.error "Failed to write C-Gate access control file"
+    exit 1
 fi
 
 # Set the project name and port configuration in C-Gate config. This runs on

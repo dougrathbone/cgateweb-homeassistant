@@ -18,6 +18,13 @@ set -euo pipefail
 SHARE_TAG_DIR="${CGATEWEB_SHARE_TAG_DIR:-/share/cgate/tag}"
 DATA_CGATE_DIR="${CGATEWEB_DATA_CGATE_DIR:-/data/cgate}"
 PROJECTS_DIR="${DATA_CGATE_DIR}/Projects"
+# Probed only when SHARE_TAG_DIR is missing (issue #28 follow-up): File
+# Editor's root is /config (shown as /homeassistant in current Home
+# Assistant), so a "share/cgate/tag" folder made there lands at
+# /config/share/cgate/tag, not the top-level /share/cgate/tag this add-on
+# maps (config.yaml: share:ro). Overridable for unit tests.
+CONFIG_SHARE_CGATE_DIR="${CGATEWEB_CONFIG_SHARE_CGATE_DIR:-/config/share/cgate}"
+CONFIG_SHARE_TAG_DIR="${CONFIG_SHARE_CGATE_DIR}/tag"
 
 CGATE_MODE=$(bashio::config 'cgate_mode' 'remote')
 if [[ "${CGATE_MODE}" != "managed" ]]; then
@@ -43,8 +50,44 @@ _cgateweb_warn_no_project() {
     bashio::log.warning "Note: importing labels into the cgateweb web UI does NOT install the project into C-Gate."
 }
 
+# issue #28 follow-up: a user placed a .cbz (Toolkit export) in the tag dir
+# and got only the generic "no project found" warning above -- nothing named
+# the file, so he reasonably concluded from the web UI's label importer (which
+# does accept .cbz/.xml) that the format was fine for a project install too.
+# Called only when SHARE_TAG_DIR has files the *.db loop could not use and no
+# .db was found at all; name what we found and head off that exact mix-up.
+_cgateweb_warn_unusable_files() {
+    local -a names=("$@")
+    local name
+    local has_zip=0
+    for name in "${names[@]}"; do
+        [[ "${name}" == *.zip ]] && has_zip=1
+    done
+    bashio::log.warning "Found file(s) in ${SHARE_TAG_DIR}/ that cannot be loaded into C-Gate: ${names[*]}"
+    bashio::log.warning "Only <PROJECT>.db is synced into C-Gate; every other file type is ignored."
+    bashio::log.warning ".cbz and .xml are accepted by the web UI to import labels ONLY — they do not install a project into C-Gate."
+    if [[ "${has_zip}" -eq 1 ]]; then
+        bashio::log.warning "A .zip may be a C-Bus Toolkit project archive — extract it to find the <PROJECT>.db inside."
+    fi
+    bashio::log.warning "The file you need is <PROJECT>.db from C-Gate's tag/ directory in your Toolkit install, not an XML export."
+}
+
+# issue #28 follow-up: File Editor's root is /config (shown as /homeassistant
+# in current Home Assistant), so a user creating "share/cgate/tag" there via
+# File Editor actually creates /config/share/cgate/tag, not the top-level
+# /share/cgate/tag this add-on maps (config.yaml: share:ro). The add-on cannot
+# see /config at all, so the plain "directory does not exist" message gives no
+# hint this is the mistake. Call it out by name when detected.
+_cgateweb_warn_wrong_share_location() {
+    bashio::log.warning "No project tag directory at ${SHARE_TAG_DIR}, but found ${CONFIG_SHARE_TAG_DIR} instead."
+    bashio::log.warning "/config/share (shown as /homeassistant/share in the File Editor add-on) is not the same as the top-level /share this add-on reads."
+    bashio::log.warning "Move your project files to ${SHARE_TAG_DIR} (accessible via the Samba, SSH, or File Editor add-ons' top-level 'share' folder) and restart."
+}
+
 if [[ ! -d "${SHARE_TAG_DIR}" ]]; then
-    if _cgateweb_have_project_db; then
+    if [[ -d "${CONFIG_SHARE_TAG_DIR}" || -d "${CONFIG_SHARE_CGATE_DIR}" ]]; then
+        _cgateweb_warn_wrong_share_location
+    elif _cgateweb_have_project_db; then
         bashio::log.info "No project tag directory at ${SHARE_TAG_DIR}; skipping project sync"
     else
         _cgateweb_warn_no_project
@@ -77,7 +120,25 @@ done
 shopt -u nullglob
 
 if [[ ${SYNCED} -eq 0 && ${SKIPPED} -eq 0 ]]; then
-    if _cgateweb_have_project_db; then
+    # No *.db matched at all. Distinguish "nothing here" from "files here we
+    # just can't use" (issue #28 follow-up) so the latter names the files
+    # instead of falling back to the generic warning.
+    shopt -s nullglob
+    tag_dir_entries=("${SHARE_TAG_DIR}"/*)
+    shopt -u nullglob
+    unusable_names=()
+    # Guard the iteration on length first: with `set -u`, expanding
+    # "${arr[@]}" on a zero-element array is an "unbound variable" error on
+    # the bash 3.2 shipped by macOS (fixed in 4.4+), even though `${#arr[@]}`
+    # is always safe.
+    if ((${#tag_dir_entries[@]} > 0)); then
+        for entry in "${tag_dir_entries[@]}"; do
+            [[ -f "${entry}" ]] && unusable_names+=("$(basename "${entry}")")
+        done
+    fi
+    if ((${#unusable_names[@]} > 0)); then
+        _cgateweb_warn_unusable_files "${unusable_names[@]}"
+    elif _cgateweb_have_project_db; then
         bashio::log.info "No .db files found in ${SHARE_TAG_DIR}; nothing to sync"
     else
         _cgateweb_warn_no_project
@@ -86,19 +147,48 @@ elif [[ ${SKIPPED} -gt 0 ]]; then
     bashio::log.info "Skipped ${SKIPPED} project(s) - destination newer than share copy"
 fi
 
-# ALPHA (issue #28): point Windows-authored project interfaces at the
-# configured USB-serial PCI. Toolkit projects saved on Windows reference a COMx
-# port that cannot exist on Linux, so C-Gate opens the network with
-# InterfaceState=closed and every TREEXML comes back empty. Rewrite those
-# addresses to the resolved cgate_serial_device port name BEFORE C-Gate loads
-# the project. Runs every boot (idempotent) so a re-synced Windows project is
-# fixed again. Only meaningful in managed mode with the alpha opt-in set.
-SERIAL_DEVICE=$(bashio::config 'cgate_serial_device' '')
-if [[ -n "${SERIAL_DEVICE}" && "${SERIAL_DEVICE}" != "null" ]]; then
+# ALPHA (issue #28): point the project's serial interface at the configured
+# USB-serial PCI. Two cases, both leaving the network at InterfaceState=closed
+# with every TREEXML empty:
+#   - a Toolkit project saved on Windows names a COMx port, which cannot exist
+#     on Linux at all; and
+#   - a project written by this add-on names the ttyUSBn it used last boot,
+#     which a PC Interface that renumbered while we were stopped no longer
+#     answers to.
+# Rewrite either to the resolved cgate_serial_device port name BEFORE C-Gate
+# loads the project. --repoint-stale-serial is what covers the second case; the
+# in-running recovery (cgateweb-recover-serial) cannot, because from its point
+# of view the device resolves fine and has not moved since boot. The flag only
+# ever touches a row the project itself calls serial whose address has a serial
+# port's shape, so a CNI's ip:port row is left alone. Runs every boot
+# (idempotent). Only meaningful in managed mode with the alpha opt-in set.
+#
+# Use the path cont-init's resolver already agreed on rather than resolving
+# cgate_serial_device again here: a PC Interface that renumbered still has its
+# old path in the option, and rewriting the project to a device that no longer
+# exists leaves the network closed. The file is missing or empty only when the
+# resolver could not run (no node) or could not publish, so fall back to the
+# option there.
+# Shared with cgate-install.sh and cgateweb-serial-diagnostics: one definition
+# of the default file path and the "read the resolver's answer, fall back to
+# the configured option" logic (see the helper for why this can't just be an
+# exported variable).
+CGATEWEB_SERIAL_DEVICE_LIB="${CGATEWEB_SERIAL_DEVICE_LIB:-/usr/lib/cgateweb/serial-device.sh}"
+# Non-constant path, so this is SC1090 ("can't follow non-constant source"),
+# not SC1091 ("file not found"). The helper is linted directly by CI.
+# shellcheck disable=SC1090
+source "${CGATEWEB_SERIAL_DEVICE_LIB}"
+CONFIGURED_SERIAL_DEVICE=$(bashio::config 'cgate_serial_device' '')
+SERIAL_DEVICE=$(cgateweb_effective_serial_device "${CONFIGURED_SERIAL_DEVICE}")
+# The opt-in is the configured option and nothing else: a resolved-device file
+# left behind by a boot where it *was* set must never re-enable the rewrite for
+# a user who has since cleared the option.
+PROJECT_FIXUP_JS="${CGATEWEB_PROJECT_FIXUP_JS:-/usr/bin/cgateweb-project-serial-fixup.js}"
+if [[ -n "${CONFIGURED_SERIAL_DEVICE}" && "${CONFIGURED_SERIAL_DEVICE}" != "null" ]]; then
     if command -v node >/dev/null 2>&1; then
         shopt -s nullglob
         for db in "${PROJECTS_DIR}"/*/*.db; do
-            if ! OUT=$(node /usr/bin/cgateweb-project-serial-fixup.js "${db}" "${SERIAL_DEVICE}" 2>&1); then
+            if ! OUT=$(node "${PROJECT_FIXUP_JS}" "${db}" "${SERIAL_DEVICE}" --repoint-stale-serial 2>&1); then
                 bashio::log.warning "Project serial fixup failed for ${db}: ${OUT}"
             elif [[ "${OUT}" == *"rewrote project interface"* ]]; then
                 bashio::log.info "${OUT}"

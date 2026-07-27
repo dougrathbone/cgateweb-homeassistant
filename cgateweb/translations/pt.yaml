@@ -69,6 +69,10 @@ configuration:
     name: Dispositivo PCI série (beta)
     description: >-
       BETA: suporte a interfaces PC USB-série (5500PC/5500PCU) — testado com ambas as interfaces. Selecione um dispositivo série detetado na lista pendente; prefira caminhos /dev/serial/by-id/. Para introduzir um caminho personalizado, mude o editor de configuração para o modo YAML. Requer o modo gerido e um projeto C-Bus Toolkit configurado para uma interface PC série. Reporte problemas no GitHub (issue #28).
+  cgate_external_clients:
+    name: Clientes C-Gate externos
+    description: >-
+      Endereços autorizados a ligar-se ao C-Gate gerido, para ferramentas como o C-Bus Toolkit. Deixe vazio para permitir apenas este add-on. O C-Gate não tem autenticação, e o nível program permite reprogramar unidades C-Bus, por isso indique endereços específicos em vez de uma sub-rede inteira. Um octeto com o valor 255 corresponde a qualquer valor, pelo que 192.168.1.255 significa toda a rede 192.168.1.x. Também tem de publicar as portas do C-Gate no painel de Rede.
   # ── MQTT (geralmente detetado automaticamente) ──
   mqtt_host:
     name: Host do Broker MQTT
@@ -328,4 +332,9 @@ configuration:
     name: Tipo por prefixo de etiqueta
     description: >-
       Tratar uma etiqueta de grupo que comece com um prefixo de domínio de entidade como esse tipo de dispositivo (ex.: cover.estore_quarto torna-se uma cobertura, switch.luz_alpendre um interruptor). Prefixos suportados: light., cover., switch., relay., pir. Uma entrada manual em type_overrides tem sempre prioridade. Desativado por predefinição.
+
+  ha_discovery_type_from_unit:
+    name: Tipo pelo tipo de unidade C-Bus
+    description: >-
+      Determinar o tipo de cada entidade a partir da unidade C-Bus que comanda o grupo, para grupos cujo nome ainda não identifique um estore. Canais de dimmer tornam-se luzes reguláveis, canais de relé luzes de ligar/desligar e grupos comandados apenas por uma unidade de entrada como um bus coupler tornam-se sensores binários. Uma entrada manual em type_overrides e um nome que identifique um estore (por ex. blind, shutter) continuam a ter prioridade, já que um relé pode igualmente comandar uma luz, um estore ou uma válvula. Os grupos com tipos de unidade não reconhecidos ficam inalterados. Ativar isto pode alterar o tipo de entidades que já existem.
 

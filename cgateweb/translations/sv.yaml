@@ -67,6 +67,10 @@ configuration:
     name: Seriell PCI-enhet (beta)
     description: >-
       BETA: stöd för USB-seriella PC-gränssnitt (5500PC/5500PCU) — testat med båda gränssnitten. Välj en upptäckt seriell enhet i rullgardinsmenyn; föredra sökvägar under /dev/serial/by-id/. För att ange en anpassad sökväg, växla konfigurationsredigeraren till YAML-läge. Kräver hanterat läge och ett C-Bus Toolkit-projekt konfigurerat för ett seriellt PC-gränssnitt. Rapportera problem på GitHub (ärende #28).
+  cgate_external_clients:
+    name: Externa C-Gate-klienter
+    description: >-
+      Adresser som tillåts ansluta till den hanterade C-Gate, för verktyg som C-Bus Toolkit. Lämna tomt för att endast tillåta detta tillägg. C-Gate saknar autentisering, och nivån program tillåter omprogrammering av C-Bus-enheter, så ange specifika adresser istället för ett helt subnät. En oktett med värdet 255 matchar vilket värde som helst, så 192.168.1.255 betyder hela nätverket 192.168.1.x. Du måste också publicera C-Gates portar i nätverkspanelen.
   # ── MQTT (upptäcks vanligtvis automatiskt) ──
   mqtt_host:
     name: MQTT Broker värd
@@ -318,4 +322,9 @@ configuration:
     name: Typ från etiketttprefix
     description: >-
       Behandla en gruppetikett som börjar med ett entitetsdomänprefix som den enhetstypen (t.ex. cover.sovrum_persienn blir en cover, switch.altan_ljus en switch). Prefix som stöds: light., cover., switch., relay., pir. En manuell type_overrides-post vinner alltid. Av som standard.
+
+  ha_discovery_type_from_unit:
+    name: Typ från C-Bus-enhetstyp
+    description: >-
+      Bestäm varje entitets typ utifrån den C-Bus-enhet som styr gruppen, för grupper vars namn inte redan identifierar en persienn. Dimmerkanaler blir dimbara lampor, reläkanaler blir på/av-lampor och grupper som bara styrs av en ingångsenhet som en bus coupler blir binära sensorer. En manuell type_overrides-post och ett namn som identifierar en persienn (t.ex. blind, shutter) vinner fortfarande, eftersom ett relä lika gärna kan styra en lampa, en persienn eller en ventil. Grupper med okända enhetstyper lämnas oförändrade. Att slå på detta kan ändra typen på entiteter du redan har.
 

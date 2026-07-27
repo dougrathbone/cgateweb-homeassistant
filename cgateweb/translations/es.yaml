@@ -69,6 +69,10 @@ configuration:
     name: Dispositivo PCI serie (beta)
     description: >-
       BETA: soporte para interfaces PC USB-serie (5500PC/5500PCU) — probado con ambas interfaces. Seleccione un dispositivo serie detectado en la lista desplegable; prefiera las rutas /dev/serial/by-id/. Para introducir una ruta personalizada, cambie el editor de configuración al modo YAML. Requiere el modo gestionado y un proyecto de C-Bus Toolkit configurado para una interfaz PC serie. Informe los problemas en GitHub (issue #28).
+  cgate_external_clients:
+    name: Clientes externos de C-Gate
+    description: >-
+      Direcciones autorizadas a conectarse al C-Gate gestionado, para herramientas como C-Bus Toolkit. Déjelo vacío para permitir solo este add-on. C-Gate no tiene autenticación, y el nivel program permite reprogramar unidades C-Bus, así que indique direcciones específicas en lugar de una subred completa. Un octeto con el valor 255 coincide con cualquier valor, por lo que 192.168.1.255 significa toda la red 192.168.1.x. También debe publicar los puertos de C-Gate en el panel de red.
   # ── MQTT (generalmente se detecta automáticamente) ──
   mqtt_host:
     name: Host del broker MQTT
@@ -332,4 +336,9 @@ configuration:
     name: Tipo por prefijo de etiqueta
     description: >-
       Tratar una etiqueta de grupo que empiece con un prefijo de dominio de entidad como ese tipo de dispositivo (p. ej. cover.persiana_dormitorio se convierte en cubierta, switch.luz_porche en interruptor). Prefijos soportados: light., cover., switch., relay., pir. Una entrada manual en type_overrides siempre tiene prioridad. Desactivado por defecto.
+
+  ha_discovery_type_from_unit:
+    name: Tipo por tipo de unidad C-Bus
+    description: >-
+      Determinar el tipo de cada entidad a partir de la unidad C-Bus que controla el grupo, para los grupos cuyo nombre no identifique ya una persiana. Los canales de dimmer se convierten en luces regulables, los canales de relé en luces de encendido/apagado, y los grupos controlados solo por una unidad de entrada como un bus coupler en sensores binarios. Las entradas manuales en type_overrides y un nombre que identifique una persiana (p. ej. blind, shutter) siguen teniendo prioridad, ya que un relé puede controlar igualmente una luz, una persiana o una válvula. Los grupos con tipos de unidad no reconocidos quedan sin cambios. Activarlo puede cambiar el tipo de entidades que ya tienes.
 

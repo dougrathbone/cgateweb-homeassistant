@@ -78,6 +78,17 @@ const defaultSettings = {
     // with their intended HA entity id (issue #35). Opt-in; manual
     // type_overrides still win.
     ha_discovery_type_from_label_prefix: false,
+    // Resolve a group's discovery type from the C-Bus unit that drives it
+    // (issues #38, #37): dimmer channels become dimmable lights, relay channels
+    // on/off lights, and groups driven only by an input unit (bus coupler, key
+    // input) become binary sensors. Opt-in, because enabling it can change which
+    // entity a group already published as. Precedence: manual type_overrides
+    // win first, then the cover-name keyword heuristics, then this unit-type
+    // classification. Cover names outrank unit type because a relay can equally
+    // drive a light, a motorised blind or an irrigation valve — a name that
+    // positively identifies a cover is better evidence than the hardware type.
+    // Unrecognised unit types are left alone.
+    ha_discovery_type_from_unit: false,
     ha_discovery_hvac_app_id: null,
     // C-Bus Air Conditioning app ID for native temperature reads (e.g. 172); null disables.
     cbus_aircon_app_id: null,
@@ -120,6 +131,37 @@ const defaultSettings = {
     // Supervisor API) if a C-Bus network's CNI/PCI goes offline, and dismiss it
     // on recovery. Requires the add-on environment (SUPERVISOR_TOKEN).
     cni_offline_notification: false,
+    // Local USB PC Interface (managed mode only, issue #28). Set from the
+    // add-on's cgate_serial_device option; null means a CNI/network interface,
+    // which is what makes all the serialRecovery* handling below inert.
+    cgate_serial_device: null,
+    // Recover from a USB PC Interface that renumbered while running (issue #28).
+    // Only engages in managed mode with cgate_serial_device set AND the device
+    // path either gone or now pointing at a different port, so a CNI dropout
+    // never triggers it. Recovery re-resolves the device by its remembered
+    // identity, repoints the project database, and restarts managed C-Gate.
+    serialRecoveryEnabled: true,
+    // Restarts per outage before giving up and telling the user to reconnect the
+    // interface and restart the add-on.
+    serialRecoveryMaxAttempts: 3,
+    // Backoff between attempts within one outage (exponential from the initial
+    // delay, capped at the max), so a flapping interface cannot turn into a
+    // C-Gate restart loop.
+    serialRecoveryInitialDelayMs: 5000,
+    serialRecoveryMaxDelayMs: 300000,
+    // How long the interface must have been back up for the next outage to count
+    // as new trouble and get a fresh attempt budget.
+    serialRecoveryStableWindowMs: 900000,
+    // Cap on the recovery helper's run time. The helper runs synchronously from
+    // inside C-Gate response processing, so for its whole duration MQTT keepalive
+    // and LWT, the connection-pool health checks and every timer are stalled
+    // behind it - the timeout is the only thing bounding that stall. A real run
+    // costs 2-5s (node startup, the resolver, sql.js per project database, the
+    // signal), so this is a few times the expected cost rather than the minute it
+    // used to be: long enough for a slow disk, short enough that a wedged helper
+    // does not look like a dead bridge. Clamped to a 1s floor, since 0 would mean
+    // "no timeout" to execFileSync and block indefinitely.
+    serialRecoveryTimeoutMs: 15000,
     // Web diagnostics: window (ms) within which a device counts as "active" in
     // the status page's device list. Default 24h.
     web_active_device_window_ms: 24 * 60 * 60 * 1000,

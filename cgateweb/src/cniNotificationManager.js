@@ -13,7 +13,7 @@ const { MQTT_TOPIC_PREFIX_READ, MQTT_STATE_ON, MQTT_STATE_OFF } = require('./con
  * original CgateWebBridge implementation.
  */
 class CniNotificationManager {
-    constructor({ networkInterfaceMonitor, mqttManager, getHaDiscovery, logger, settings, mqttOptions }) {
+    constructor({ networkInterfaceMonitor, mqttManager, getHaDiscovery, logger, settings, mqttOptions, serialDeviceRecovery }) {
         this.networkInterfaceMonitor = networkInterfaceMonitor;
         this.mqttManager = mqttManager;
         // haDiscovery is initialized after the bridge constructor runs, so read it
@@ -22,6 +22,10 @@ class CniNotificationManager {
         this.logger = logger;
         this.settings = settings;
         this.mqttOptions = mqttOptions;
+        // Optional: recovers a USB PC Interface that renumbered while running
+        // (issue #28). Absent in tests that do not need it; inert unless a
+        // serial device is configured in managed mode.
+        this.serialDeviceRecovery = serialDeviceRecovery || null;
     }
 
     handleReading(networkId, reading) {
@@ -33,19 +37,47 @@ class CniNotificationManager {
             haDiscovery.ensureNetworkConnectivityDiscovery(networkId);
         }
 
-        if (result.changed && result.online !== null) {
+        // An unknown/transitional reading tells us nothing to act on.
+        if (result.online === null) return;
+
+        if (result.changed) {
             this.mqttManager.publish(
                 `${MQTT_TOPIC_PREFIX_READ}/${networkId}/cni/state`,
                 result.online ? MQTT_STATE_ON : MQTT_STATE_OFF,
                 { ...this.mqttOptions, retain: true }
             );
+        }
 
-            if (this.settings.cni_offline_notification) {
-                if (result.online === false) {
-                    this._notifyCniOffline(networkId, result.interfaceState);
-                } else {
-                    this._dismissCniNotification(networkId);
-                }
+        // Before the notification handling, and deliberately not gated on
+        // cni_offline_notification: recovering the interface is not a
+        // notification feature.
+        //
+        // Nor is it gated on result.changed, which the publish and the
+        // notification above are. Once a network is closed the monitor reports
+        // online:false on every poll with changed:false, so a transition-only
+        // hand-off would only ever get one shot -- and that shot lands while the
+        // PC Interface is still unplugged. The replug that follows produces no
+        // transition, so the whole feature would be limited to replugs that
+        // complete inside a single poll window. Passing every offline reading
+        // lets SerialDeviceRecovery notice the replug on the next poll; its own
+        // backoff and attempt cap are what throttle the repeats.
+        if (this.serialDeviceRecovery) {
+            if (result.online === false) {
+                this.serialDeviceRecovery.handleInterfaceDown(networkId);
+            } else if (result.changed) {
+                // Only on the transition: handleInterfaceUp stamps "the interface
+                // has been up since now", which decides whether the next outage
+                // earns a fresh attempt budget. Re-stamping it every poll would
+                // mean no outage ever qualified.
+                this.serialDeviceRecovery.handleInterfaceUp(networkId);
+            }
+        }
+
+        if (result.changed && this.settings.cni_offline_notification) {
+            if (result.online === false) {
+                this._notifyCniOffline(networkId, result.interfaceState);
+            } else {
+                this._dismissCniNotification(networkId);
             }
         }
     }

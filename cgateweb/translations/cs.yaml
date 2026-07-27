@@ -68,6 +68,10 @@ configuration:
     name: Sériové PCI zařízení (beta)
     description: >-
       BETA: podpora USB-sériových PC rozhraní (5500PC/5500PCU) — otestováno s oběma rozhraními. Vyberte detekované sériové zařízení z rozbalovací nabídky; preferujte cesty /dev/serial/by-id/. Chcete-li zadat vlastní cestu, přepněte editor konfigurace do režimu YAML. Vyžaduje spravovaný režim a projekt C-Bus Toolkit nakonfigurovaný pro sériové PC rozhraní. Problémy hlaste na GitHubu (issue #28).
+  cgate_external_clients:
+    name: Externí klienti C-Gate
+    description: >-
+      Adresy, kterým je povoleno připojit se ke spravovanému C-Gate, pro nástroje jako C-Bus Toolkit. Ponechte prázdné, pokud chcete povolit pouze tento doplněk. C-Gate nemá žádné ověřování a úroveň program umožňuje přeprogramování jednotek C-Bus, proto uvádějte konkrétní adresy místo celé podsítě. Oktet s hodnotou 255 odpovídá jakékoli hodnotě, takže 192.168.1.255 znamená celou síť 192.168.1.x. Musíte také zveřejnit porty C-Gate v panelu Síť.
   # ── MQTT (obvykle detekován automaticky) ──
   mqtt_host:
     name: Hostitel MQTT brokera
@@ -320,4 +324,9 @@ configuration:
     name: Typ z prefixu štítku
     description: >-
       Považovat štítek skupiny začínající prefixem domény entity za tento typ zařízení (např. cover.rolety_loznice se stane krytem, switch.svetlo_veranda spínačem). Podporované prefixy: light., cover., switch., relay., pir. Ruční záznam type_overrides má vždy přednost. Ve výchozím stavu vypnuto.
+
+  ha_discovery_type_from_unit:
+    name: Typ z typu jednotky C-Bus
+    description: >-
+      Určit typ každé entity podle jednotky C-Bus, která skupinu ovládá, u skupin, jejichž název sám o sobě neurčuje roletu. Kanály stmívače se stanou stmívatelnými světly, kanály relé světly zap/vyp a skupiny ovládané pouze vstupní jednotkou, například bus coupler, se stanou binárními senzory. Ruční záznam type_overrides i název určující roletu (např. blind, shutter) mají stále přednost, protože relé může stejně dobře ovládat světlo, roletu nebo ventil. Skupiny ovládané nerozpoznanými typy jednotek zůstanou nezměněné. Zapnutí může změnit typ entit, které již máte.
 

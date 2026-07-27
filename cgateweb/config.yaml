@@ -1,5 +1,5 @@
 name: "C-Gate Web Bridge"
-version: "1.17.6"
+version: "1.19.0"
 slug: cgateweb
 description: "Bridge between Clipsal C-Bus systems and MQTT/Home Assistant"
 url: "https://github.com/dougrathbone/cgateweb"
@@ -21,9 +21,15 @@ panel_title: "C-Bus Labels"
 
 ports:
   "8080/tcp": null
+  "20023/tcp": null
+  "20024/tcp": null
+  "20025/tcp": null
 
 ports_description:
   "8080/tcp": "C-Bus Label Editor web interface (optional; ingress works without host mapping — set web_api_key if you expose this port)"
+  "20023/tcp": "C-Gate command port (managed mode only). Home Assistant can only map ports declared by the add-on, so exposing C-Gate to external clients requires leaving cgate_port at its default 20023 -- a custom cgate_port cannot be mapped here. C-Gate has NO authentication: list allowed addresses in cgate_external_clients before publishing this."
+  "20024/tcp": "C-Gate event port (managed mode only). C-Gate has NO authentication: list allowed addresses in cgate_external_clients before publishing this."
+  "20025/tcp": "C-Gate status change port (managed mode only). C-Gate has NO authentication: list allowed addresses in cgate_external_clients before publishing this."
 
 homeassistant_api: true
 
@@ -71,6 +77,9 @@ options:
     - roller
     - garage door
   web_allowed_origins: []
+  # Object lists cannot be optional, so this needs a default here. Empty means
+  # localhost-only access, identical to previous releases.
+  cgate_external_clients: []
 
 # ─── Schema ─────────────────────────────────────────────────────────
 # Fields without ? are required. Fields with ? are optional and hidden
@@ -93,6 +102,12 @@ schema:
   # Deliberately absent from options above so upgrades never write it into
   # existing configs.
   cgate_serial_device: "device(subsystem=tty)?"
+  # External C-Gate access (issue #37). C-Gate is a multi-client server, so
+  # Toolkit connects to the managed instance rather than sharing the PCI.
+  # An octet of 255 matches any value: 192.168.1.255 is the whole subnet.
+  cgate_external_clients:
+    - address: "str"
+      level: "list(monitor|operate|program)"
 
   # ── MQTT (auto-detected from Mosquitto add-on) ──
   mqtt_host: "str?"
@@ -131,6 +146,7 @@ schema:
   ha_discovery_auto_type: "bool?"
   ha_discovery_auto_type_name_heuristics: "bool?"
   ha_discovery_type_from_label_prefix: "bool?"
+  ha_discovery_type_from_unit: "bool?"
   ha_discovery_auto_type_cover_keywords: ["str"]
   ha_discovery_hvac_app_id: "int(1,255)?"
   cbus_aircon_app_id: "int(1,255)?"

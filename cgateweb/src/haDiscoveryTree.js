@@ -1,4 +1,6 @@
 // @ts-check
+const { categoriseUnitType } = require('./unitTypeClassifier');
+
 function findNetworkData(networkId, treeData) {
     if (!treeData) return null;
     const idStr = String(networkId);
@@ -265,6 +267,134 @@ function collectUnitGroups(unit, groupsByApp, targetApps) {
     });
 }
 
+// Which app/group pairs each unit type drives, and which unit types on the
+// network the classifier does not recognise. Both are derived from the same
+// per-unit Type/Application data, so a single pass over networkData.Unit
+// produces both instead of walking the array twice (once per aggregate) on
+// every discovery run.
+//
+// The two aggregates have different scope, though, and must not be conflated:
+//   - index is scoped to targetApps, since it exists to classify groups on the
+//     apps discovery actually cares about (issues #38, #37). Mirrors
+//     collectUnitGroups' handling of both TREEXML shapes, but keeps the unit
+//     type that collectUnitGroups discards. Records every type it encounters
+//     for a matching group, recognised or not: entityTypeForGroup's asymmetric
+//     unknown handling (an unrecognised type blocks only the destructive
+//     binary_sensor conclusion) depends on unrecognised types surviving into
+//     this index rather than being filtered out here.
+//
+//     That includes the blank type a unit with an absent or empty <Type> gets.
+//     Dropping those used to let a driving unit register its group while
+//     contributing nothing to it, so a load sharing a group with a key input
+//     looked input-only, was published as a read-only binary_sensor, and had
+//     its light config retracted — an unswitchable load. A blank type is
+//     precisely "a unit we cannot classify", which is what the unrecognised
+//     path is for, so it belongs in the set.
+//   - unknownTypes is, by default, restricted to the units that actually fed
+//     the index. The log line it drives asks users to report types so they can
+//     be classified (issue #37), so a type that could never classify anything —
+//     a measurement-only unit, a PC interface, anything bound to no discovered
+//     application — is pure noise on every run, gettree refreshes included, and
+//     invites issues about irrelevant hardware. opts.scopeUnknownTypesToIndex
+//     false restores the whole-network view for the unknownUnitTypes diagnostic
+//     helper below.
+/**
+ * @param {any} networkData
+ * @param {string[]} targetApps
+ * @param {{ scopeUnknownTypesToIndex?: boolean }} [opts]
+ * @returns {{ index: Map<string, { types: Set<string> }>, unknownTypes: string[] }}
+ */
+function collectUnitTypeData(networkData, targetApps, opts = {}) {
+    const scopeUnknownTypesToIndex = opts.scopeUnknownTypesToIndex !== false;
+    /** @type {Map<string, { types: Set<string> }>} */
+    const index = new Map();
+    const unknownTypes = new Set();
+    if (!networkData) return { index, unknownTypes: [] };
+
+    let units = networkData.Unit || [];
+    if (!Array.isArray(units)) units = [units];
+
+    // Index every (app, group) this unit drives on a target app; true when it
+    // drove at least one, i.e. when its type is relevant to classification.
+    const indexUnitGroups = (unit, type) => {
+        let indexed = false;
+        const record = (appId, groupId) => {
+            const key = `${appId}/${groupId}`;
+            if (!index.has(key)) index.set(key, { types: new Set() });
+            // Added even when blank: see the scope note above. A unit that
+            // drives the group must contribute to its classification, and "we
+            // could not read a type for it" is information, not absence.
+            index.get(key).types.add(type);
+            indexed = true;
+        };
+
+        if (!unit.Application) return false;
+
+        if (typeof unit.Application === 'object') {
+            const apps = Array.isArray(unit.Application) ? unit.Application : [unit.Application];
+            apps.forEach(app => {
+                if (!app || app.ApplicationAddress === null || app.ApplicationAddress === undefined) return;
+                const appId = String(app.ApplicationAddress);
+                if (!targetApps.includes(appId) || !app.Group) return;
+                const groups = Array.isArray(app.Group) ? app.Group : [app.Group];
+                groups.forEach(g => {
+                    if (g && g.GroupAddress !== null && g.GroupAddress !== undefined) {
+                        record(appId, String(g.GroupAddress));
+                    }
+                });
+            });
+            return indexed;
+        }
+
+        const unitAppIds = String(unit.Application).split(',').map(s => s.trim()).filter(Boolean);
+        const groupIds = (unit.Groups && typeof unit.Groups === 'string')
+            ? unit.Groups.split(',').map(s => s.trim()).filter(Boolean)
+            : [];
+        if (groupIds.length === 0) return false;
+        targetApps.filter(t => unitAppIds.includes(t)).forEach(appId => {
+            groupIds.forEach(gid => record(appId, gid));
+        });
+        return indexed;
+    };
+
+    units.forEach(unit => {
+        if (!unit) return;
+        const type = (unit.Type !== null && unit.Type !== undefined) ? String(unit.Type).trim() : '';
+        const indexed = indexUnitGroups(unit, type);
+        if (type && !categoriseUnitType(type) && (indexed || !scopeUnknownTypesToIndex)) {
+            unknownTypes.add(type);
+        }
+    });
+
+    return { index, unknownTypes: [...unknownTypes] };
+}
+
+// Thin wrapper kept for existing callers/tests that only need the per-group
+// index. Prefer collectUnitTypeData directly when both aggregates are needed
+// in the same discovery pass (see src/haDiscovery.js), so the unit array is
+// only walked once.
+/**
+ * @param {any} networkData
+ * @param {string[]} targetApps
+ * @returns {Map<string, { types: Set<string> }>}
+ */
+function collectUnitTypesByGroup(networkData, targetApps) {
+    return collectUnitTypeData(networkData, targetApps).index;
+}
+
+// Whole-network diagnostic view: every unrecognised type anywhere on the
+// network, including units bound to no application at all. Discovery
+// deliberately does NOT use this (see collectUnitTypeData: the log line it feeds
+// is about classifiable hardware only) — it is here for callers that genuinely
+// want an inventory of what the classifier does not know.
+/**
+ * @param {any} networkData
+ * @returns {string[]}
+ */
+function unknownUnitTypes(networkData) {
+    return collectUnitTypeData(networkData, [], { scopeUnknownTypesToIndex: false }).unknownTypes;
+}
+
 module.exports = {
     findNetworkData,
     collectUnitGroups,
@@ -273,5 +403,8 @@ module.exports = {
     unsyncedUnitSummaries,
     treeGroupSignature,
     unitHasDeviceData,
-    unitHasUnsyncedGroups
+    unitHasUnsyncedGroups,
+    collectUnitTypeData,
+    collectUnitTypesByGroup,
+    unknownUnitTypes
 };

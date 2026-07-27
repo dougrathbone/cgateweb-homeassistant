@@ -66,6 +66,10 @@ configuration:
     name: Urządzenie PCI szeregowe (beta)
     description: >-
       BETA: obsługa interfejsów PC USB-szeregowych (5500PC/5500PCU) — przetestowana z oboma interfejsami. Wybierz wykryte urządzenie szeregowe z listy rozwijanej; preferuj ścieżki /dev/serial/by-id/. Aby wpisać własną ścieżkę, przełącz edytor konfiguracji w tryb YAML. Wymaga trybu zarządzanego i projektu C-Bus Toolkit skonfigurowanego dla szeregowego interfejsu PC. Problemy zgłaszaj na GitHubie (zgłoszenie #28).
+  cgate_external_clients:
+    name: Zewnętrzni klienci C-Gate
+    description: >-
+      Adresy, którym wolno łączyć się z zarządzanym C-Gate, dla narzędzi takich jak C-Bus Toolkit. Pozostaw puste, aby zezwolić tylko temu dodatkowi. C-Gate nie ma uwierzytelniania, a poziom program pozwala na przeprogramowanie jednostek C-Bus, więc podawaj konkretne adresy zamiast całej podsieci. Oktet o wartości 255 pasuje do dowolnej wartości, więc 192.168.1.255 oznacza całą sieć 192.168.1.x. Musisz również opublikować porty C-Gate w panelu Sieć.
   # ── MQTT (zazwyczaj wykrywany automatycznie) ──
   mqtt_host:
     name: Host brokera MQTT
@@ -322,4 +326,9 @@ configuration:
     name: Typ z prefiksu etykiety
     description: >-
       Traktuj etykietę grupy zaczynającą się od prefiksu domeny encji jako ten typ urządzenia (np. cover.zaluzje_sypialnia stanie się roletą, switch.swiatlo_ganek przełącznikiem). Obsługiwane prefiksy: light., cover., switch., relay., pir. Ręczny wpis type_overrides zawsze ma pierwszeństwo. Domyślnie wyłączone.
+
+  ha_discovery_type_from_unit:
+    name: Typ z typu jednostki C-Bus
+    description: >-
+      Ustal typ każdej encji na podstawie jednostki C-Bus, która steruje grupą, dla grup, których nazwa nie wskazuje już na roletę. Kanały ściemniacza stają się ściemnialnymi światłami, kanały przekaźnika światłami wł/wył, a grupy sterowane wyłącznie przez jednostkę wejściową, taką jak bus coupler, stają się sensorami binarnymi. Ręczny wpis type_overrides oraz nazwa wskazująca na roletę (np. blind, shutter) nadal mają pierwszeństwo, ponieważ przekaźnik może równie dobrze sterować światłem, roletą lub zaworem. Grupy sterowane przez nierozpoznane typy jednostek pozostają bez zmian. Włączenie tej opcji może zmienić typ już istniejących encji.
 
