@@ -10,6 +10,7 @@ const ConnectionManager = require('./connectionManager');
 const EventPublisher = require('./eventPublisher');
 const AirconEventHandler = require('./airconEventHandler');
 const SecurityEventHandler = require('./securityEventHandler');
+const { LINE_UNPARSED } = require('./applicationDecoders/appEventLine');
 const StateResyncCoordinator = require('./stateResyncCoordinator');
 const CommandResponseProcessor = require('./commandResponseProcessor');
 const DeviceStateManager = require('./deviceStateManager');
@@ -28,6 +29,10 @@ const { LineProcessor } = require('./lineProcessor');
 const { MQTT_RETAINED_STATE_OPTIONS, CGATE_EVENT_NETWORK_SYNC_REGEX } = require('./constants');
 const { clampSetting } = require('./utils');
 const { parseRawCaptureTarget } = require('./rawEventCapture');
+
+// Publish options for the raw event capture topic: never retained, prebuilt
+// once (mqtt.js does not mutate the options object) instead of per line.
+const RAW_CAPTURE_MQTT_OPTIONS = Object.freeze({ retain: false, qos: 0 });
 
 /**
  * Main bridge class that connects C-Gate (Clipsal C-Bus automation system) to MQTT.
@@ -286,6 +291,7 @@ class CgateWebBridge {
             haDiscovery: null, // Will be set after haDiscovery is initialized
             onObjectStatus: (event) => this.deviceStateManager.updateLevelFromEvent(event),
             onNetworkState: (networkId, reading) => this._handleNetworkInterfaceReading(networkId, reading),
+            onNetworkSyncComplete: (networkId) => this._handleNetworkSyncComplete(networkId),
             logger: this.logger
         });
 
@@ -366,12 +372,21 @@ class CgateWebBridge {
      */
     _buildEventLogBuffer() {
         const eventLogMax = Math.max(10, Number(this.settings.eventLogMaxEntries) || 200);
-        this._eventLogBuffer = [];
+        // Circular buffer with a head index: once full, overwriting the oldest
+        // slot is O(1) where Array.shift() was O(n) per event. The array is
+        // only materialized (in order) by getRecent.
+        this._eventLogSize = eventLogMax;
+        this._eventLogBuffer = new Array(eventLogMax);
+        this._eventLogHead = 0;  // slot holding the oldest entry
+        this._eventLogCount = 0; // entries stored (≤ _eventLogSize)
         this._eventLogListeners = new Set();
         this._onEventLog = (entry) => {
-            this._eventLogBuffer.push(entry);
-            if (this._eventLogBuffer.length > eventLogMax) {
-                this._eventLogBuffer.shift();
+            if (this._eventLogCount < this._eventLogSize) {
+                this._eventLogBuffer[(this._eventLogHead + this._eventLogCount) % this._eventLogSize] = entry;
+                this._eventLogCount++;
+            } else {
+                this._eventLogBuffer[this._eventLogHead] = entry;
+                this._eventLogHead = (this._eventLogHead + 1) % this._eventLogSize;
             }
             for (const fn of this._eventLogListeners) {
                 try { fn(entry); } catch (e) { this.logger.debug('Event-log listener threw', { error: e }); }
@@ -382,7 +397,13 @@ class CgateWebBridge {
         this.eventStream = {
             subscribe: (fn) => { this._eventLogListeners.add(fn); },
             unsubscribe: (fn) => { this._eventLogListeners.delete(fn); },
-            getRecent: () => [...this._eventLogBuffer]
+            getRecent: () => {
+                const recent = new Array(this._eventLogCount);
+                for (let i = 0; i < this._eventLogCount; i++) {
+                    recent[i] = this._eventLogBuffer[(this._eventLogHead + i) % this._eventLogSize];
+                }
+                return recent;
+            }
         };
     }
 
@@ -424,8 +445,14 @@ class CgateWebBridge {
         });
 
         // A mid-session broker reconnect may have dropped the retained discovery
-        // configs along with the state, so this path republishes both.
-        this.mqttManager.on('reconnect', () => this.stateResyncCoordinator.requestResync('mqtt-reconnect'));
+        // configs along with the state, so this path republishes both. The
+        // diagnostics and stale-device configs bypass HaDiscovery's recorder,
+        // so they are replayed here explicitly.
+        this.mqttManager.on('reconnect', () => {
+            this.stateResyncCoordinator.requestResync('mqtt-reconnect');
+            this.haBridgeDiagnostics.republishDiscovery();
+            this.staleDeviceDetector.republishDiscovery();
+        });
 
         // Data processing handlers - pass connection for per-connection line processing
         this.commandConnectionPool.on('data', (data, connection) => this._handleCommandData(data, connection));
@@ -602,7 +629,8 @@ class CgateWebBridge {
 
     /**
      * Delegates native-aircon (app 172) event-line handling to AirconEventHandler.
-     * Returns true when the line was an aircon line and was consumed there.
+     * Returns the handler's tri-state: true (consumed), LINE_UNPARSED (aircon
+     * traffic the handler didn't consume), or false (not aircon traffic).
      */
     _handleAirconLine(line) {
         return this.airconEventHandler.handleLine(line);
@@ -610,18 +638,23 @@ class CgateWebBridge {
 
     /**
      * Delegates security (app 208) event-line handling to SecurityEventHandler.
-     * Returns true when the line was a security line and was consumed there.
+     * Returns the handler's tri-state: true (consumed), LINE_UNPARSED (security
+     * traffic the handler didn't consume), or false (not security traffic).
      */
     _handleSecurityLine(line) {
         return this.securityEventHandler.handleLine(line);
     }
 
     _processEventLine(line) {
-        if (this._handleAirconLine(line)) return;
         // Security lines are `#`-comment-prefixed like aircon lines; consume
         // them before the generic comment-dropping branch so zone events don't
         // publish a bogus OFF and status reports don't warn-spam the parser.
-        if (this._handleSecurityLine(line)) return;
+        // Both handlers classify the line exactly once and report a tri-state,
+        // which the unparsed branches below reuse instead of re-scanning.
+        const airconState = this._handleAirconLine(line);
+        if (airconState === true) return;
+        const securityState = this._handleSecurityLine(line);
+        if (securityState === true) return;
 
         if (line.startsWith('#')) {
             this.logger.debug(`Ignoring comment from event port: ${line}`);
@@ -635,18 +668,11 @@ class CgateWebBridge {
 
         // C-Gate "Network sync ok" status event (code 762, visible at event
         // level 6+): the network finished synchronising, so its tree is now
-        // fully populated. Forward to HA Discovery to re-fetch groups that
-        // were still empty (unsynced) at startup (issue #25). Not a CBusEvent,
-        // so return before the standard parse (avoids a spurious warning).
+        // fully populated. Not a CBusEvent, so return before the standard
+        // parse (avoids a spurious warning).
         const syncedNetworkId = this._parseNetworkSyncComplete(line);
         if (syncedNetworkId) {
-            this.logger.info(`C-Gate event: network ${syncedNetworkId} sync complete`);
-            if (this.haDiscovery) {
-                this.haDiscovery.handleNetworkSyncComplete(syncedNetworkId);
-            }
-            // Post-sync zone-state refresh: deduplicated inside the handler
-            // (one post-762 pair per network per session).
-            this.securityEventHandler.requestStatusSync(syncedNetworkId, 'sync');
+            this._handleNetworkSyncComplete(syncedNetworkId);
             return;
         }
 
@@ -656,18 +682,17 @@ class CgateWebBridge {
             this.logger.debug(`C-Gate Recv (Evt): ${line}`);
         }
 
-        // Aircon-format lines that weren't consumed above (feature disabled, an
-        // unsupported verb, or a different app) are surfaced in raw capture but
-        // are never valid CBusEvents — skip the parse so they don't spam a
-        // "Could not parse event line" warning on every broadcast.
-        if (this.airconEventHandler.isAirconLine(line)) {
+        // App lines the handlers recognised but didn't consume (an unsupported
+        // verb or a different app) are surfaced in raw capture but are never
+        // valid CBusEvents — skip the parse so they don't spam a "Could not
+        // parse event line" warning on every broadcast. The handlers already
+        // classified the line, so these reuse their tri-state instead of
+        // re-scanning with isAirconLine/isSecurityLine.
+        if (airconState === LINE_UNPARSED) {
             this.logger.debug(`Unparsed aircon line (captured, not a standard event): ${line}`);
             return;
         }
-
-        // Same for unconsumed security lines (feature disabled, an unsupported
-        // verb, or a different app): never valid CBusEvents.
-        if (this.securityEventHandler.isSecurityLine(line)) {
+        if (securityState === LINE_UNPARSED) {
             this.logger.debug(`Unparsed security line (captured, not a standard event): ${line}`);
             return;
         }
@@ -697,6 +722,28 @@ class CgateWebBridge {
 
 
     /**
+     * Single entry point for C-Gate's "Network sync ok" (762), reached from
+     * both the event-port line (_processEventLine) and the command-port async
+     * event (CommandResponseProcessor onNetworkSyncComplete). Runs every
+     * post-sync effect exactly once per notification:
+     *   - HA Discovery re-fetches the now fully-populated tree to pick up
+     *     groups that were still empty (unsynced) at startup (issue #25)
+     *   - security zone-state refresh, deduplicated inside the handler
+     *     (one post-762 pair per network per session)
+     *   - lighting level resync: any startup getall that ran before the sync
+     *     missed state (issue #44); debounced inside the coordinator so
+     *     repeated 762s collapse
+     */
+    _handleNetworkSyncComplete(networkId) {
+        this.logger.info(`C-Gate event: network ${networkId} sync complete`);
+        if (this.haDiscovery) {
+            this.haDiscovery.handleNetworkSyncComplete(networkId);
+        }
+        this.securityEventHandler.requestStatusSync(networkId, 'sync');
+        this.stateResyncCoordinator.requestResync('network-sync');
+    }
+
+    /**
      * Parses a C-Gate "Network sync ok" status event (event code 762) from an
      * event-port line, e.g. "20260718-123456.789 762 //PROJECT/254 Network
      * sync ok". Returns the network id string, or null when the line is not a
@@ -722,7 +769,7 @@ class CgateWebBridge {
             this.mqttManager.publish(
                 `cbus/read/${target.network}/${target.application}/${target.group}/raw`,
                 line,
-                { retain: false, qos: 0 }
+                RAW_CAPTURE_MQTT_OPTIONS
             );
         } catch (e) {
             this.logger.debug(`Raw capture publish failed: ${e.message}`);
@@ -899,20 +946,6 @@ class CgateWebBridge {
             this.connectionManager?.logger,
         ].filter(Boolean).forEach(l => l.setLevel(level));
     }
-
-    // Legacy method compatibility for tests
-    _connectMqtt() {
-        return this.mqttManager.connect();
-    }
-
-    _connectCommandSocket() {
-        return this.commandConnection.connect();
-    }
-
-    _connectEventSocket() {
-        return this.eventConnection.connect();
-    }
-
 
 }
 

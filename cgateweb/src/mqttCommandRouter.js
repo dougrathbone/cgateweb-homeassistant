@@ -111,7 +111,9 @@ class MqttCommandRouter extends EventEmitter {
      * @param {string} payload - MQTT payload
      */
     routeMessage(topic, payload) {
-        this.logger.debug(`MQTT Recv: ${topic} -> ${payload}`);
+        if (this.logger.isLevelEnabled && this.logger.isLevelEnabled('debug')) {
+            this.logger.debug(`MQTT Recv: ${topic} -> ${payload}`);
+        }
 
         // Handle manual HA discovery trigger
         if (topic === MQTT_TOPIC_MANUAL_TRIGGER) {
@@ -350,12 +352,17 @@ class MqttCommandRouter extends EventEmitter {
     }
 
     /**
-     * Cleans up pending relative level operations (timers and listeners).
+     * Cleans up pending relative level operations (timers and listeners) and
+     * any debounced aircon setpoint writes, so no timer fires after shutdown.
      */
     shutdown() {
         if (this.deviceStateManager) {
             this.deviceStateManager.clearAllOperations();
         }
+        for (const pending of this._airconSetpointTimers.values()) {
+            clearTimeout(pending.handle);
+        }
+        this._airconSetpointTimers.clear();
     }
 
     /**
@@ -367,31 +374,17 @@ class MqttCommandRouter extends EventEmitter {
      * @private
      */
     _handlePosition(command, topic) {
-        if (!command.getGroup()) {
-            this.logger.warn(`Position command requires device ID on topic ${topic}`);
-            return;
-        }
-
-        const cbusPath = this._buildCGatePath(command);
-        const level = command.getLevel();
-
-        if (level !== null) {
-            // Use RAMP command to set cover position
-            // Level is already converted from percentage (0-100) to C-Gate level (0-255)
-            const cgateCommand = `${CGATE_CMD_RAMP} ${cbusPath} ${level}${NEWLINE}`;
-            this._queueCommand(cgateCommand, 'interactive');
-
-            const network = command.getNetwork();
-            const application = command.getApplication();
-            const group = command.getGroup();
-            this.logger.debug(`Setting cover position: ${network}/${application}/${group} to level ${level}`);
-
-            // Start interpolated position updates so HA shows smooth movement
-            // Position payloads always produce a numeric level (or null, excluded above).
-            this._startCoverRamp(network, application, group, /** @type {number} */ (level), null);
-        } else {
-            this.logger.warn(`Invalid position value for topic ${topic}`);
-        }
+        this._queueRampCommand(command, topic, {
+            name: 'Position',
+            priority: 'interactive',
+            invalidText: `Invalid position value for topic ${topic}`,
+            debugLine: (n, a, g, l) => `Setting cover position: ${n}/${a}/${g} to level ${l}`,
+            afterQueue: (level) => {
+                // Start interpolated position updates so HA shows smooth movement
+                // Position payloads always produce a numeric level (or null, excluded above).
+                this._startCoverRamp(command.getNetwork(), command.getApplication(), command.getGroup(), /** @type {number} */ (level), null);
+            }
+        });
     }
 
     /**
@@ -402,23 +395,51 @@ class MqttCommandRouter extends EventEmitter {
      * @private
      */
     _handleTilt(command, topic) {
+        this._queueRampCommand(command, topic, {
+            name: 'Tilt',
+            priority: 'interactive',
+            invalidText: `Invalid tilt value for topic ${topic}`,
+            debugLine: (n, a, g, l) => `Setting cover tilt: ${n}/${a}/${g} to level ${l}`
+        });
+    }
+
+    /**
+     * Shared core for the level-carrying write handlers (position, tilt,
+     * trigger): group guard, RAMP assembly, queue and debug log. The deltas
+     * live in the spec: queue priority, log wording and an optional
+     * after-queue hook (position's ramp tracker).
+     *
+     * @param {CBusCommand} command
+     * @param {string} topic - Original topic for error logging
+     * @param {Object} spec
+     * @param {string} spec.name - Command name for the missing-group warning.
+     * @param {string|null} spec.priority - Queue priority (null = default).
+     * @param {string} spec.invalidText - Warning for an unparseable payload.
+     * @param {(network: string, application: string, group: string, level: string|number) => string} spec.debugLine
+     * @param {(level: string|number) => void} [spec.afterQueue]
+     * @private
+     */
+    _queueRampCommand(command, topic, spec) {
         if (!command.getGroup()) {
-            this.logger.warn(`Tilt command requires device ID on topic ${topic}`);
+            this.logger.warn(`${spec.name} command requires device ID on topic ${topic}`);
             return;
         }
 
-        const cbusPath = this._buildCGatePath(command);
         const level = command.getLevel();
-
-        if (level !== null) {
-            // Use RAMP command to set tilt angle
-            // Level is already converted from percentage (0-100) to C-Gate level (0-255)
-            const cgateCommand = `${CGATE_CMD_RAMP} ${cbusPath} ${level}${NEWLINE}`;
-            this._queueCommand(cgateCommand, 'interactive');
-            this.logger.debug(`Setting cover tilt: ${command.getNetwork()}/${command.getApplication()}/${command.getGroup()} to level ${level}`);
-        } else {
-            this.logger.warn(`Invalid tilt value for topic ${topic}`);
+        if (level === null || level === undefined) {
+            this.logger.warn(spec.invalidText);
+            return;
         }
+
+        // Level is already converted from percentage (0-100) to C-Gate level (0-255)
+        const cgateCommand = `${CGATE_CMD_RAMP} ${this._buildCGatePath(command)} ${level}${NEWLINE}`;
+        if (spec.priority) {
+            this._queueCommand(cgateCommand, spec.priority);
+        } else {
+            this._queueCommand(cgateCommand);
+        }
+        this.logger.debug(spec.debugLine(command.getNetwork(), command.getApplication(), command.getGroup(), level));
+        if (spec.afterQueue) spec.afterQueue(level);
     }
 
     /**
@@ -503,21 +524,12 @@ class MqttCommandRouter extends EventEmitter {
      * @private
      */
     _handleTrigger(command, topic) {
-        if (!command.getGroup()) {
-            this.logger.warn(`Trigger command requires device ID on topic ${topic}`);
-            return;
-        }
-
-        const cbusPath = this._buildCGatePath(command);
-        const level = command.getLevel();
-
-        if (level !== null && level !== undefined) {
-            const cgateCommand = `${CGATE_CMD_RAMP} ${cbusPath} ${level}${NEWLINE}`;
-            this._queueCommand(cgateCommand);
-            this.logger.debug(`Firing trigger: ${command.getNetwork()}/${command.getApplication()}/${command.getGroup()} at level ${level}`);
-        } else {
-            this.logger.warn(`Invalid trigger payload for topic ${topic}`);
-        }
+        this._queueRampCommand(command, topic, {
+            name: 'Trigger',
+            priority: null,
+            invalidText: `Invalid trigger payload for topic ${topic}`,
+            debugLine: (n, a, g, l) => `Firing trigger: ${n}/${a}/${g} at level ${l}`
+        });
     }
 
     /**
@@ -548,12 +560,45 @@ class MqttCommandRouter extends EventEmitter {
             String(command.getApplication()) === String(this.settings.cbus_aircon_app_id);
     }
 
+    /**
+     * Whether a native HVAC write may proceed: warns and returns false when
+     * cbus_aircon_control_enabled is off.
+     *
+     * @param {string} what - What was attempted ('setpoint', 'mode', 'fan mode').
+     * @param {string} topic - Original topic for the warning.
+     * @returns {boolean}
+     * @private
+     */
+    _nativeAirconControlAllowed(what, topic) {
+        if (this.settings.cbus_aircon_control_enabled) return true;
+        this.logger.warn(`Native HVAC control is disabled (set cbus_aircon_control_enabled to enable); ignoring ${what} on ${topic}`);
+        return false;
+    }
+
+    /**
+     * The thermostat state learned from its broadcasts, or null (with a
+     * warning) when the unit hasn't reported yet — native writes need its
+     * ward/zones/type, so there is nothing to build a command from before then.
+     *
+     * @param {string} network
+     * @param {string} unit - Thermostat source unit address.
+     * @param {string} what - What was attempted ('set setpoint', 'set mode', 'set fan mode').
+     * @param {string} topic - Original topic for the warning.
+     * @returns {Object|null}
+     * @private
+     */
+    _requireNativeAirconState(network, unit, what, topic) {
+        const state = this.airconControlRegistry && this.airconControlRegistry.get(network, unit);
+        if (!state) {
+            this.logger.warn(`No known HVAC state for ${network}/${unit} yet; cannot ${what} until the thermostat reports once (${topic})`);
+            return null;
+        }
+        return state;
+    }
+
     _handleHvacSetpoint(command, payload, topic) {
         if (this._isNativeAircon(command)) {
-            if (!this.settings.cbus_aircon_control_enabled) {
-                this.logger.warn(`Native HVAC control is disabled (set cbus_aircon_control_enabled to enable); ignoring setpoint on ${topic}`);
-                return;
-            }
+            if (!this._nativeAirconControlAllowed('setpoint', topic)) return;
             return this._handleNativeAirconSetpoint(command, payload, topic);
         }
 
@@ -594,10 +639,7 @@ class MqttCommandRouter extends EventEmitter {
      */
     _handleHvacMode(command, payload, topic) {
         if (this._isNativeAircon(command)) {
-            if (!this.settings.cbus_aircon_control_enabled) {
-                this.logger.warn(`Native HVAC control is disabled (set cbus_aircon_control_enabled to enable); ignoring mode on ${topic}`);
-                return;
-            }
+            if (!this._nativeAirconControlAllowed('mode', topic)) return;
             return this._handleNativeAirconMode(command, payload, topic);
         }
 
@@ -635,11 +677,8 @@ class MqttCommandRouter extends EventEmitter {
     _handleNativeAirconSetpoint(command, payload, topic) {
         const network = command.getNetwork();
         const unit = command.getGroup();
-        const state = this.airconControlRegistry && this.airconControlRegistry.get(network, unit);
-        if (!state) {
-            this.logger.warn(`No known HVAC state for ${network}/${unit} yet; cannot set setpoint until the thermostat reports once (${topic})`);
-            return;
-        }
+        const state = this._requireNativeAirconState(network, unit, 'set setpoint', topic);
+        if (!state) return;
         if (state.modeRaw === 0) {
             // Writing a setpoint to an off thermostat would force it on in the
             // fallback mode — the climate card adjusting a target must never
@@ -714,7 +753,7 @@ class MqttCommandRouter extends EventEmitter {
             modeRaw,
             rawlevel: 0,
             ...this._airconFlagEcho(state),
-            type: (state.type !== null && state.type !== undefined) ? state.type : 0,
+            type: state.type,
             level
         });
         this._queueCommand(cmd + NEWLINE);
@@ -761,11 +800,8 @@ class MqttCommandRouter extends EventEmitter {
         const network = command.getNetwork();
         const unit = command.getGroup();
         const application = command.getApplication();
-        const state = this.airconControlRegistry && this.airconControlRegistry.get(network, unit);
-        if (!state) {
-            this.logger.warn(`No known HVAC state for ${network}/${unit} yet; cannot set mode until the thermostat reports once (${topic})`);
-            return;
-        }
+        const state = this._requireNativeAirconState(network, unit, 'set mode', topic);
+        if (!state) return;
 
         const mode = String(payload).toLowerCase();
         if (mode === 'off') {
@@ -793,7 +829,7 @@ class MqttCommandRouter extends EventEmitter {
             modeRaw: code,
             rawlevel,
             ...this._airconFlagEcho(state),
-            type: (state.type !== null && state.type !== undefined) ? state.type : 0,
+            type: state.type,
             level
         });
         this._queueCommand(cmd + NEWLINE);
@@ -830,10 +866,7 @@ class MqttCommandRouter extends EventEmitter {
      */
     _handleHvacFanMode(command, payload, topic) {
         if (this._isNativeAircon(command)) {
-            if (!this.settings.cbus_aircon_control_enabled) {
-                this.logger.warn(`Native HVAC control is disabled (set cbus_aircon_control_enabled to enable); ignoring fan mode on ${topic}`);
-                return;
-            }
+            if (!this._nativeAirconControlAllowed('fan mode', topic)) return;
             return this._handleNativeAirconFanMode(command, payload, topic);
         }
         this.logger.warn(`HVAC fan mode is only supported on the native Air Conditioning application; ignoring ${topic}`);
@@ -851,11 +884,8 @@ class MqttCommandRouter extends EventEmitter {
         const network = command.getNetwork();
         const unit = command.getGroup();
         const application = command.getApplication();
-        const state = this.airconControlRegistry && this.airconControlRegistry.get(network, unit);
-        if (!state) {
-            this.logger.warn(`No known HVAC state for ${network}/${unit} yet; cannot set fan mode until the thermostat reports once (${topic})`);
-            return;
-        }
+        const state = this._requireNativeAirconState(network, unit, 'set fan mode', topic);
+        if (!state) return;
         if (state.modeRaw === 0) {
             // Same guard as the setpoint path: a fan-mode write would force the
             // off unit on in the fallback mode.
@@ -896,7 +926,7 @@ class MqttCommandRouter extends EventEmitter {
             setback: flags.setback,
             guard: flags.guard,
             useaux,
-            type: (state.type !== null && state.type !== undefined) ? state.type : 0,
+            type: state.type,
             level,
             aux
         });
