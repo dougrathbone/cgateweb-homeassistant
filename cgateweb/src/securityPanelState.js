@@ -21,6 +21,48 @@ const ALARM_STATE_BY_ARM_MODE = {
 };
 
 /**
+ * Where an arm mode this table has never seen lands. The spec (§5.5.1.1) only
+ * fixes $00 disarmed, $01 fully armed and $02 partially armed, and hands
+ * $03-$7F to "manufacturers discretion" — so a panel broadcasting a custom
+ * sub-mode is conformant, not broken. Publishing nothing for those (the old
+ * behaviour) left Home Assistant showing whatever it last knew, which after a
+ * disarm→custom-arm sequence reads "disarmed" on a panel that is armed. That is
+ * the one direction of error that matters: it silently disables away
+ * automations and tells the user the house is open when it is not. armed_away
+ * is the most protective of the armed states, so unknown non-zero modes land
+ * there and the raw mode rides along in `armMode` for anyone who needs the
+ * detail.
+ */
+const UNKNOWN_ARM_MODE_STATE = 'armed_away';
+
+/**
+ * Key the isolated-zone list rides under inside a network's persisted entry.
+ * Deliberately not a condition name: `restore` only copies keys listed in
+ * PANEL_TROUBLE_CONDITIONS, so an older build reading a newer file ignores this
+ * key rather than choking on it, and a newer build reading an older file simply
+ * finds no isolation.
+ */
+const ISOLATED_ZONES_KEY = 'isolated_zones';
+
+/**
+ * HA alarm panel state for a raw C-Bus arm mode.
+ *
+ * Mode 0 is disarmed and stays disarmed — never guess "armed" from the one
+ * value the spec defines as not-armed. A non-integer or absent mode says
+ * nothing at all, so it maps to null (no publish) rather than to a state.
+ *
+ * @param {number|null|undefined} mode
+ * @returns {string|null}
+ * @private
+ */
+function alarmStateForArmMode(mode) {
+    if (!Number.isInteger(mode)) return null;
+    const known = ALARM_STATE_BY_ARM_MODE[/** @type {number} */(mode)];
+    if (known) return known;
+    return /** @type {number} */(mode) > 0 ? UNKNOWN_ARM_MODE_STATE : null;
+}
+
+/**
  * Tracks panel-wide trouble state per C-Bus network so the bridge only
  * publishes actual transitions. A panel repeating `mains_failure` while the
  * power is still out should not republish MQTT state or re-log at INFO.
@@ -30,6 +72,18 @@ const ALARM_STATE_BY_ARM_MODE = {
  * trouble conditions this needs no persistence: status_report_1's arm-state
  * prefix re-seeds it on every connect sync.
  *
+ * Finally it tracks per-zone isolation (the zones the panel bypassed when it
+ * armed, spec §5.5.1.15) and each zone's last reported 2-bit state. Isolation
+ * lives here rather than in SecurityEventHandler for two reasons:
+ *   - it is network-scoped panel state cleared by a network-scoped panel event
+ *     (the disarm), which this class already sees and already reasons about;
+ *   - it is unqueryable, exactly like the trouble conditions, so it belongs in
+ *     the snapshot that survives a restart (see toJSON).
+ * The last zone state rides along because it is not separately published state:
+ * it exists only so an isolation change can re-render the zone's attributes
+ * payload without inventing or dropping the `zone_state` attribute that
+ * automations already read.
+ *
  * Deliberately separate from SecurityEventHandler: the transition and
  * derived-clear rules are the fiddly part of this feature and are far easier to
  * test as a standalone unit than through the handler's line-parsing path.
@@ -38,8 +92,14 @@ class SecurityPanelState {
     constructor() {
         /** @type {Map<string, Object<string, boolean>>} network → condition → active */
         this._byNetwork = new Map();
-        /** @type {Map<string, { state: string|null, preAlarmState: string|null, blockingZone: string|null }>} */
+        /** @type {Map<string, { state: string|null, preAlarmState: string|null, blockingZone: string|null, armMode: number|null }>} */
         this._alarmByNetwork = new Map();
+        /**
+         * network → { states: zone → last 2-bit state, isolated: set of zones }.
+         * Bounded by the panel's zone count (≤128 per network), so no eviction.
+         * @type {Map<string, { states: Map<string, string>, isolated: Set<string> }>}
+         */
+        this._zonesByNetwork = new Map();
     }
 
     /**
@@ -93,7 +153,7 @@ class SecurityPanelState {
     }
 
     /**
-     * All seven conditions and their current values, for seeding state at
+     * Every condition and its current value, for seeding state at
      * discovery time. Conditions never seen default to inactive: assuming
      * healthy keeps the entities usable in automations immediately, and a stale
      * value self-corrects on the next transition or disarm. The alternative
@@ -101,7 +161,7 @@ class SecurityPanelState {
      * complaint behind issue #44.
      *
      * @param {string} network
-     * @returns {Array<{condition: string, active: boolean}>} all seven
+     * @returns {Array<{condition: string, active: boolean}>} one per condition
      */
     initialStates(network) {
         const state = this._forNetwork(network);
@@ -109,16 +169,126 @@ class SecurityPanelState {
     }
 
     /**
-     * Snapshot every network's conditions for persistence:
-     * { network: { condition: active } }. The panel offers no way to query
-     * mains, battery, line, arm-fail or fire, so this snapshot is the only way
-     * those survive a bridge restart (#42).
+     * Remember a zone's last reported 2-bit state (sealed/unsealed/open/short).
      *
-     * @returns {Object<string, Object<string, boolean>>}
+     * Not published from here and not persisted — the status reports re-seed
+     * every zone on connect. It exists so an isolation change can re-render the
+     * zone's whole attributes payload: the attributes topic is a full replace in
+     * Home Assistant, so publishing isolation without the state the zone was
+     * last known to be in would silently delete the `zone_state` attribute.
+     *
+     * @param {string|number} network
+     * @param {string|number} zone
+     * @param {string} zoneState
+     */
+    noteZoneState(network, zone, zoneState) {
+        if (network === null || network === undefined || zone === null || zone === undefined) return;
+        if (!zoneState) return;
+        this._zonesForNetwork(network).states.set(String(zone), zoneState);
+    }
+
+    /**
+     * The zone's last reported 2-bit state, or null if none has been seen. Null
+     * is a real case: a panel can isolate a zone before the initial status
+     * report has arrived (or when the report never does).
+     *
+     * @param {string|number} network
+     * @param {string|number} zone
+     * @returns {string|null}
+     */
+    lastZoneState(network, zone) {
+        const entry = this._zonesByNetwork.get(String(network));
+        if (!entry) return null;
+        return entry.states.get(String(zone)) || null;
+    }
+
+    /**
+     * @param {string|number} network
+     * @param {string|number} zone
+     * @returns {boolean} whether the zone is currently isolated (bypassed).
+     */
+    isZoneIsolated(network, zone) {
+        const entry = this._zonesByNetwork.get(String(network));
+        if (!entry) return false;
+        return entry.isolated.has(String(zone));
+    }
+
+    /**
+     * Record that the panel isolated (bypassed) a zone for this armed period.
+     *
+     * Returns false for a repeat so callers publish transitions only — a panel
+     * re-announcing the same isolation, or a second arm of an already-isolated
+     * zone, should not put another message on the attributes topic.
+     *
+     * @param {string|number} network
+     * @param {string|number} zone
+     * @returns {boolean} true when this call actually changed the zone.
+     */
+    setZoneIsolated(network, zone) {
+        if (network === null || network === undefined || zone === null || zone === undefined) return false;
+        const entry = this._zonesForNetwork(network);
+        const key = String(zone);
+        if (entry.isolated.has(key)) return false;
+        entry.isolated.add(key);
+        return true;
+    }
+
+    /**
+     * Drop every isolation recorded for a network and report what was dropped,
+     * so the caller can republish those zones' attributes.
+     *
+     * Isolation is scoped to one armed period (spec §5.5.1.15) — a disarm ends
+     * it for every zone at once, and the panel sends no per-zone "no longer
+     * isolated" event. Without this a bypassed zone would keep an `isolated`
+     * attribute for the rest of the bridge's life, which is worse than not
+     * showing isolation at all: it would claim a door is uncovered while the
+     * system is disarmed and, on the next arm, while it is genuinely covered.
+     *
+     * Each entry carries the zone's last known state so the republished payload
+     * keeps `zone_state` intact.
+     *
+     * @param {string|number} network
+     * @returns {Array<{zone: string, zoneState: string|null}>} zones that were isolated.
+     */
+    clearZoneIsolation(network) {
+        if (network === null || network === undefined) return [];
+        const entry = this._zonesByNetwork.get(String(network));
+        if (!entry || entry.isolated.size === 0) return [];
+        const cleared = [...entry.isolated].map((zone) => ({
+            zone,
+            zoneState: entry.states.get(zone) || null
+        }));
+        entry.isolated.clear();
+        return cleared;
+    }
+
+    /**
+     * Snapshot every network's conditions for persistence:
+     * { network: { condition: active, isolated_zones?: [zone] } }. The panel
+     * offers no way to query mains, battery, line, arm-fail or fire, so this
+     * snapshot is the only way those survive a bridge restart (#42).
+     *
+     * Zone isolation is in the snapshot for the same reason — it cannot be
+     * queried either — and because forgetting it is the dangerous direction of
+     * error: a restart mid-armed-period would otherwise show a bypassed door as
+     * covered, which is precisely what making isolation visible is for. The
+     * stale-in-the-other-direction risk (a disarm missed while the bridge was
+     * down) is reconciled on reconnect, where a status report that says the
+     * panel is disarmed clears isolation before the zones are published.
+     *
+     * The key is omitted when nothing is isolated, so the common file is
+     * byte-identical to the pre-isolation format.
+     *
+     * @returns {Object<string, Object<string, boolean|Array<string>>>}
      */
     toJSON() {
         const out = {};
         for (const [network, state] of this._byNetwork) out[network] = { ...state };
+        for (const [network, entry] of this._zonesByNetwork) {
+            if (entry.isolated.size === 0) continue;
+            if (!out[network]) out[network] = {};
+            out[network][ISOLATED_ZONES_KEY] = [...entry.isolated];
+        }
         return out;
     }
 
@@ -127,7 +297,12 @@ class SecurityPanelState {
      * values are ignored, so a hand-edited or newer-version file cannot
      * corrupt the tracker; unknown networks are adopted as-is.
      *
-     * @param {Object<string, Object<string, boolean>>} data
+     * The isolated-zone list gets the same treatment: anything that is not an
+     * array of zone-ish scalars is skipped rather than trusted. Zone *states*
+     * are never restored — they are queryable, and a stale one would be
+     * published as fact on the next isolation change.
+     *
+     * @param {Object<string, Object<string, boolean|Array<string>>>} data
      */
     restore(data) {
         if (!data || typeof data !== 'object') return;
@@ -136,6 +311,12 @@ class SecurityPanelState {
             const target = this._forNetwork(network);
             for (const condition of PANEL_TROUBLE_CONDITIONS) {
                 if (typeof state[condition] === 'boolean') target[condition] = state[condition];
+            }
+            const isolated = state[ISOLATED_ZONES_KEY];
+            if (!Array.isArray(isolated)) continue;
+            const zones = this._zonesForNetwork(network);
+            for (const zone of isolated) {
+                if (typeof zone === 'string' || typeof zone === 'number') zones.isolated.add(String(zone));
             }
         }
     }
@@ -148,8 +329,16 @@ class SecurityPanelState {
      * followed by a system_arm broadcast that re-derives the state, so there
      * is nothing to guess there.
      *
+     * The reported `armMode` is the raw C-Bus arm mode last broadcast for the
+     * network (null until one arrives). It exists because unknown modes all
+     * collapse onto one HA state: the number is the only way to tell which
+     * manufacturer sub-mode the panel is actually in, so it belongs on the
+     * panel's attributes topic alongside the blocking zone. Readings that carry
+     * no mode inherit the tracked one rather than clearing it — alarm_on does
+     * not un-arm the panel.
+     *
      * @param {{kind: string, network: string, mode?: number|null, armState?: number, zone?: string|null}} reading
-     * @returns {{ state: string, blockingZone: string|null }|null}
+     * @returns {{ state: string, blockingZone: string|null, armMode: number|null }|null}
      */
     applyAlarmReading(reading) {
         if (!reading || reading.network === null || reading.network === undefined) return null;
@@ -157,14 +346,17 @@ class SecurityPanelState {
 
         let target;
         let blockingZone = null;
+        let armMode = entry.armMode;
         switch (reading.kind) {
             case 'system_arm':
-                target = ALARM_STATE_BY_ARM_MODE[reading.mode] || null;
+                target = alarmStateForArmMode(reading.mode);
+                armMode = Number.isInteger(reading.mode) ? /** @type {number} */(reading.mode) : armMode;
                 break;
             case 'status_report_1':
                 // The report's arm-state prefix is the one queryable source of
                 // panel state — this is how the entity learns it after startup.
-                target = ALARM_STATE_BY_ARM_MODE[reading.armState] || null;
+                target = alarmStateForArmMode(reading.armState);
+                armMode = Number.isInteger(reading.armState) ? /** @type {number} */(reading.armState) : armMode;
                 break;
             case 'exit_delay_started':
                 target = 'arming';
@@ -174,6 +366,23 @@ class SecurityPanelState {
                 blockingZone = reading.zone || null;
                 break;
             case 'arm_ready':
+                // arm_ready is emitted *during* arming to report that nothing is
+                // blocking (spec §5.5.1.25) — with a zone of 0 it means the
+                // system armed correctly. It is not a disarm notification, and
+                // treating it as one meant a late, repeated or post-arm
+                // arm_ready overwrote a live armed_away with disarmed. That is
+                // the worst possible direction to be wrong in: away automations
+                // stop, and the alarm card reassures the user the house is open
+                // while the panel is armed.
+                //
+                // So it may only seed or restore the idle state, never downgrade
+                // one: from unknown (nothing learned yet — the common case, a
+                // panel sitting ready) or from 'pending' (the blocking zone an
+                // earlier arm_not_ready named has now sealed). From 'arming',
+                // 'triggered' or any armed_* state it is ignored and the
+                // authoritative system_arm / status_report_1 keeps the entity
+                // honest.
+                if (entry.state !== null && entry.state !== 'pending') return null;
                 target = 'disarmed';
                 break;
             case 'alarm_on':
@@ -189,10 +398,14 @@ class SecurityPanelState {
         }
         if (target === null || target === undefined) return null;
 
-        if (entry.state === target && entry.blockingZone === blockingZone) return null;
+        // armMode joins the dedupe key: two custom sub-modes can share one HA
+        // state, and a move between them is a real change the attributes topic
+        // has to carry.
+        if (entry.state === target && entry.blockingZone === blockingZone && entry.armMode === armMode) return null;
         entry.state = target;
         entry.blockingZone = blockingZone;
-        return { state: target, blockingZone };
+        entry.armMode = armMode;
+        return { state: target, blockingZone, armMode };
     }
 
     /**
@@ -206,7 +419,9 @@ class SecurityPanelState {
      * and the alarm card sat blank until the panel next actually changed (#51).
      *
      * preAlarmState is deliberately kept: it is not published state, it is how
-     * alarm_off knows what to revert to, and a resync should not lose it.
+     * alarm_off knows what to revert to, and a resync should not lose it. The
+     * tracked armMode is kept for the same reason — clearing state is enough to
+     * force the republish, and the next reading carries the mode with it.
      *
      * @param {string|number} network - Stringified internally, as elsewhere here.
      */
@@ -220,15 +435,30 @@ class SecurityPanelState {
 
     /**
      * @param {string} network
-     * @returns {{ state: string|null, preAlarmState: string|null, blockingZone: string|null }}
+     * @returns {{ state: string|null, preAlarmState: string|null, blockingZone: string|null, armMode: number|null }}
      * @private
      */
     _alarmForNetwork(network) {
         const key = String(network);
         let entry = this._alarmByNetwork.get(key);
         if (!entry) {
-            entry = { state: null, preAlarmState: null, blockingZone: null };
+            entry = { state: null, preAlarmState: null, blockingZone: null, armMode: null };
             this._alarmByNetwork.set(key, entry);
+        }
+        return entry;
+    }
+
+    /**
+     * @param {string|number} network
+     * @returns {{ states: Map<string, string>, isolated: Set<string> }}
+     * @private
+     */
+    _zonesForNetwork(network) {
+        const key = String(network);
+        let entry = this._zonesByNetwork.get(key);
+        if (!entry) {
+            entry = { states: new Map(), isolated: new Set() };
+            this._zonesByNetwork.set(key, entry);
         }
         return entry;
     }
