@@ -116,6 +116,42 @@ const defaultSettings = {
     // that topic can learn it. Only enable on a broker you trust, ideally with
     // TLS.
     cbus_security_disarm_enabled: false,
+    // Opt-in on top of cbus_security_control_enabled: allow forcing an arm past
+    // an open zone (the panel's '#' key), via the alarm card's custom-bypass
+    // action or the bypass button.
+    //
+    // Its own switch rather than riding on control, because "arm the alarm" and
+    // "arm the alarm even though a door is open" are different promises - the
+    // second leaves the owner believing a zone is covered when it is not.
+    // Deliberately NOT folded into cbus_security_disarm_enabled either: someone
+    // who wants bypass should not have to enable PIN-over-MQTT disarm, which is
+    // the more dangerous of the two, just to get it.
+    cbus_security_bypass_enabled: false,
+    // Brute-force limit on disarm attempts, per network/application, in a
+    // sliding window. cgateweb cannot tell a right PIN from a wrong one - only
+    // the panel knows - so every attempt counts, successful or not.
+    //
+    // Without this, anything able to publish to the panel command topic can
+    // walk the whole PIN space: the bridge would happily type thousands of
+    // codes per minute at the panel through Emulate Keypad. 10 per 10 minutes
+    // is far more than a household generates (a wrong entry or two, then the
+    // right one) and turns a 4-digit exhaustive search into roughly a week of
+    // continuous attempts, on a topic anyone watching would notice.
+    //
+    // Runtime tunables rather than add-on options on purpose: this is a safety
+    // floor, and a UI field inviting people to raise it defeats the point.
+    securityDisarmMaxAttempts: 10,
+    securityDisarmAttemptWindowMs: 600000,
+
+    // C-Bus Measurement app ID (default 228/$E4); null disables. Gates BOTH
+    // directions: decoding "measurement data ..." event lines to
+    // cbus/read/{net}/228/{device}/{channel}/value+unit, and injecting
+    // readings via cbus/write/{net}/228/{device}/{channel}/data (payload
+    // "value,multiplier,units"). One flag for both, unlike Air Conditioning/
+    // Security's separate *_control_enabled gate — Measurement writes are how
+    // a scripted/virtual sensor gets its own data onto the bus (spec §28.2),
+    // not a hardware-actuation risk. See docs/Measurement Application.md.
+    cbus_measurement_app_id: null,
     ha_hvac_temperature_unit: 'C',
     ha_bridge_diagnostics_enabled: true,
     ha_bridge_diagnostics_interval_sec: 60,
@@ -210,6 +246,12 @@ const defaultSettings = {
     haDiscoveryTreeRetryInitialDelayMs: 2000,
     haDiscoveryTreeRetryMaxDelayMs: 60000,
     haDiscoveryTreeRequestTimeoutMs: 8000,
+    // How long a TREEXML stream may go *silent* mid-transfer before it counts
+    // as stalled. Distinct from the request timeout above, which covers "no
+    // response at all": this clock is reset by every data chunk, so it bounds
+    // idle time rather than total transfer time. Raise it only if a very large
+    // tree on slow hardware still reports "tree stream stalled".
+    haDiscoveryTreeStreamStallMs: 8000,
     // HA Discovery empty-Groups re-fetch tuning (issue #25). A TREEXML can be
     // accepted (real devices present) while other units still have empty
     // <Groups> because C-Gate hasn't finished syncing group bindings. These

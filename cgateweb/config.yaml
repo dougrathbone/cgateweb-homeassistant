@@ -1,5 +1,5 @@
 name: "C-Gate Web Bridge"
-version: "1.24.3"
+version: "1.25.0"
 slug: cgateweb
 description: "Bridge between Clipsal C-Bus systems and MQTT/Home Assistant"
 url: "https://github.com/dougrathbone/cgateweb"
@@ -26,6 +26,15 @@ ingress: true
 ingress_port: 8080
 panel_icon: "mdi:label-outline"
 panel_title: "C-Bus Labels"
+
+# Supervisor restarts the add-on when this probe fails. The Dockerfile also has
+# a HEALTHCHECK against the same port, but Supervisor does not consume Docker
+# healthchecks for add-ons - it uses this key - so without it a wedged add-on
+# was left running and Home Assistant still showed it as "Started". The web
+# server binds only after settings load and MQTT/C-Gate wiring is up, so a
+# refused connection here is a real failure rather than a slow start. The
+# Dockerfile's 180s start-period covers managed mode downloading C-Gate.
+watchdog: "tcp://[HOST]:[PORT:8080]"
 
 ports:
   "8080/tcp": null
@@ -179,6 +188,11 @@ schema:
   cbus_security_app_id: "str?"
   cbus_security_control_enabled: "bool?"
   cbus_security_disarm_enabled: "bool?"
+  cbus_security_bypass_enabled: "bool?"
+  # Measurement application (default 228/$E4). Gates both reading
+  # "measurement data ..." events to MQTT and injecting readings via
+  # cbus/write/.../data — see docs/Measurement Application.md.
+  cbus_measurement_app_id: "int(1,255)?"
   ha_hvac_temperature_unit: "list(C|F)?"
 
   # ── Bridge Diagnostics ──

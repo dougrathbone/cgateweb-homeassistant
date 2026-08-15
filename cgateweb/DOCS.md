@@ -340,7 +340,7 @@ Disable auto-discovery (`auto_discover_networks: false`) if:
 | `ha_discovery_enabled` | boolean | `true` | Enable automatic device discovery |
 | `ha_discovery_prefix` | string | `homeassistant` | MQTT discovery topic prefix |
 | `ha_discovery_networks` | list | `[254]` | Networks to scan for discovery (uses `getall_networks` if empty) |
-| `ha_discovery_cover_app_id` | integer | `203` | C-Bus app ID whose groups become `cover` entities (blinds/shutters). Defaults to `203`, which C-Bus calls **Enable Control** — a general-purpose application, not a covers-only one. If you use 203 for something else (disabling keypad keys is common), those groups will appear as covers; set this to empty to turn cover discovery off, or point it at whichever app your blinds actually use. |
+| `ha_discovery_cover_app_id` | integer | (unset) | C-Bus app ID whose groups become `cover` entities (blinds/shutters). **Off unless you set it.** `203` is the usual choice, but note C-Bus calls 203 **Enable Control** — a general-purpose application, not a covers-only one. If your 203 groups are something else (disabling keypad buttons is a common use), do not set this, or point it at whichever app your blinds actually use. Motorised covers on the Lighting application are auto-detected by name regardless of this setting. |
 | `ha_discovery_switch_app_id` | integer | (null) | C-Bus app ID for switches (optional). Leave empty to disable switch discovery. |
 | `ha_discovery_trigger_app_id` | integer | (null) | C-Bus app ID for trigger groups (keypads, scene buttons). Typically `202`. Each group is exposed as an HA `event` entity, a companion `button` entity, and (when `ha_discovery_scene_enabled` is `true`) a `scene` entity. Leave empty to disable. |
 | `ha_discovery_scene_enabled` | boolean | `true` | Publish an HA `scene` entity for each C-Bus trigger group in addition to the `event` and `button` entities. Set to `false` to suppress scene entities. |
@@ -356,6 +356,8 @@ Disable auto-discovery (`auto_discover_networks: false`) if:
 | `cbus_security_app_id` | string | `208` | C-Bus Security application id for alarm zone sensors (read-only). Publishes one `binary_sensor` per zone: `cbus/read/{network}/208/{zone}/state` is `ON` for unsealed/open/short and `OFF` for sealed, with the raw zone state (`sealed`/`unsealed`/`open`/`short`) on `cbus/read/{network}/208/{zone}/attributes`. Zone names come from the zone labels under application 1 in your Toolkit project (import them via C-Bus Labels); a device class (`motion`, `door`, `window`, `garage_door`, `smoke`) is inferred from the name. Zone state is synced on connect via `security status_request` (security panels do not answer getall). Set to `0` to disable. |
 | `cbus_security_control_enabled` | boolean | `false` | Opt-in to **arming** the security panel: adds the `cbus/write/{network}/208/panel/arm` command topic to the `alarm_control_panel` entity (`ARM_AWAY`, `ARM_NIGHT`, `ARM_HOME`, `ARM_VACATION`). Off by default — the arm command carries **no PIN** on the C-Bus network, so anything that can publish to the command topic can arm your panel. The entity is read-only without it. Disarming needs `cbus_security_disarm_enabled` as well. Requires `cbus_security_app_id` to be set. |
 | `cbus_security_disarm_enabled` | boolean | `false` | Opt-in to **disarming** as well, on top of `cbus_security_control_enabled`. C-Bus has no disarm command, so the PIN is typed at the panel via keypad emulation: Home Assistant shows its own numeric keypad and sends what you type in the command payload. **The PIN is not stored anywhere** — not in the add-on options, not in Home Assistant — but it does cross your MQTT broker on every disarm. Only enable on a broker you trust, ideally with TLS. See "Alarm panel" below. |
+| `cbus_security_bypass_enabled` | boolean | `false` | Opt-in to **forcing an arm past an open zone**, on top of `cbus_security_control_enabled`. Adds the `arm custom bypass` action to the alarm card and the "Bypass open zones" button, both of which send the panel's `#` key. Off by default and separate from arming, because an alarm armed past an open door reports **armed** while that door is not covered. Never automatic — cgateweb will not bypass a zone on your behalf. |
+| `cbus_measurement_app_id` | integer | (null) | C-Bus Measurement application id (`228`) for analogue/numeric sensor readings (temperature, power, light level, energy, etc). Decodes `measurement data ...` events and publishes `cbus/read/{network}/228/{device}/{channel}/value` (the decoded number) and `/unit` (e.g. `W`, `°C`, `lx`; empty if unitless/custom), with a `sensor` entity auto-created per device/channel. Also gates the write path: publish `value,multiplier,units` to `cbus/write/{network}/228/{device}/{channel}/data` to inject a reading onto C-Bus (e.g. from a scripted/virtual sensor) — cgateweb sends the native `MEASUREMENT DATA` command. One setting gates both directions, since — unlike Air Conditioning/Security — this isn't a hardware-control write; it's how a measurement source (physical or scripted) gets its own data onto the bus. Off by default. |
 | `ha_bridge_diagnostics_enabled` | boolean | `true` | Publish bridge health/diagnostic entities to Home Assistant via MQTT Discovery |
 | `ha_bridge_diagnostics_interval_sec` | integer | `60` | How often to refresh bridge diagnostic states (seconds) |
 
@@ -626,15 +628,16 @@ C-Bus organises device functions into numbered **applications**. Each applicatio
 |--------|-------------------|----------------|-------------------|
 | 56 | Lighting | `light` | Always enabled |
 | 172 | Air Conditioning (native) | `climate` entity (auto-created per thermostat) + state topics keyed by source unit | `cbus_aircon_app_id: 172` (+ `cbus_aircon_control_enabled` for control) |
-| 208 | Security | `binary_sensor` per alarm zone (labels from application 1) + `alarm_control_panel` per network | On by default; `cbus_security_app_id: 0` disables; `cbus_security_control_enabled: true` for arming, plus `cbus_security_disarm_enabled: true` for disarming |
+| 208 | Security | `binary_sensor` per alarm zone (labels from application 1) + `alarm_control_panel` per network | On by default; `cbus_security_app_id: 0` disables; `cbus_security_control_enabled: true` for arming, plus `cbus_security_disarm_enabled: true` for disarming and `cbus_security_bypass_enabled: true` for force-arm |
+| 228 | Measurement | `sensor` per device/channel (unit/device_class from the reading) | Opt-in via `cbus_measurement_app_id: 228` — also enables the write path |
 | 202 | Trigger groups | `event` + `button` | Opt-in via `ha_discovery_trigger_app_id` |
-| 203 | Enable Control (covers) | `cover` | `ha_discovery_cover_app_id: 203` (default) |
+| 203 | Enable Control (often covers) | `cover` | Opt-in via `ha_discovery_cover_app_id: 203` |
 | Custom | Enable Control (switches) | `switch` | Opt-in via `ha_discovery_switch_app_id` |
 | Custom | Lighting-compatible HVAC group (PAC/touchscreen-exposed) | `climate` | Opt-in via `ha_discovery_hvac_app_id` |
 
 The app ID values above are the C-Bus standard defaults. Some installations use non-standard IDs — check your C-Bus Toolkit project if a device type is not being discovered.
 
-**Application 203 is "Enable Control", not "covers".** cgateweb treats it as covers because that is its most common use in homes, but the application itself is general purpose — installers also use it for things like disabling keypad buttons under certain conditions. If your 203 groups are not blinds, clear `ha_discovery_cover_app_id` rather than letting them appear as cover entities.
+**Application 203 is "Enable Control", not "covers".** Pointing `ha_discovery_cover_app_id` at 203 is the common choice because blinds usually live there in homes, but the application itself is general purpose — installers also use it for things like disabling keypad buttons. If your 203 groups are not blinds, leave the setting unset rather than having them appear as cover entities.
 
 **Phantom groups do not report state.** A C-Bus group that is not assigned to any output unit channel — a "phantom" group, common for logic-only groups such as an Enable Control flag — does not exist on the network as far as `GET` and `GETALL` are concerned, so its state cannot be read. cgateweb can send to it, but it will never receive a level back, and if it is the only group on an application you will see the "application has no groups on network" message at startup. Assigning the group to a spare relay or dimmer channel in Toolkit makes it queryable, if you need its state in Home Assistant.
 
@@ -694,6 +697,21 @@ With `cbus_security_control_enabled: true` (off by default) the entity gains a c
 
 > **Security warning:** the C-Bus `security arm` command carries **no PIN** — anything that can publish to the command topic can arm your panel. Only enable control on a broker you trust.
 
+#### Bypassing open zones
+
+When arming stalls at `pending` because a zone is open (`arm_not_ready` names it in the attributes), the physical keypad's `#` key bypasses the open zones and lets the arm continue.
+
+This is a **third** opt-in, `cbus_security_bypass_enabled: true`, on top of `cbus_security_control_enabled`. It is separate from arming because it makes a different promise: an alarm armed past an open door reports **armed** to you and to Home Assistant, while that door is not actually covered. Turning on arming should not quietly hand out "arm anyway" as well.
+
+With both enabled there are two ways to send the `#` keypress from Home Assistant, so the arm flow (arm → bypass → armed) completes without walking to the keypad:
+
+- **On the alarm card itself** — the panel offers Home Assistant's **arm custom bypass** action, which is the tidier option if you already drive the panel from a dashboard card.
+- **A separate "Bypass open zones" button** on the panel device, which is easier to call from a script or put on its own dashboard.
+
+Both send exactly the same `SECURITY EMULATE_KEYPAD` command; use whichever suits your setup. Neither appears at all while `cbus_security_bypass_enabled` is off, so you never get a control that silently does nothing.
+
+> This is deliberately never automatic. Bypassing an open zone is a security decision, and only the person who can see the open window should make it — the add-on will not force an arm on your behalf just because a zone is unsealed.
+
 #### Disarming
 
 Disarming is a **second** opt-in, `cbus_security_disarm_enabled: true`, on top of `cbus_security_control_enabled`. The two are separate because they are not equally risky: arming cannot let anyone in.
@@ -710,8 +728,26 @@ What this means for your PIN:
 
   > **If you captured a debug log while disarming on 1.24.0, 1.24.1 or 1.24.2, treat it as containing your PIN.** Those versions redacted the PIN from cgateweb's own messages but not from the raw C-Gate protocol lines logged at debug level, where each keypress appeared individually. Fixed in 1.24.3. Debug logging is off by default, so this only affects you if you turned it on and kept the output — delete any such log, or change your PIN if you shared one.
 - Only digits are accepted. Keypad emulation can send any character, so a non-numeric payload is rejected rather than typed at the panel.
+- **Attempts are rate limited** to 10 per 10 minutes per network, which is far more than normal use and slow enough to make guessing the PIN over MQTT impractical. cgateweb cannot tell a correct PIN from an incorrect one — only the panel can — so every well-formed attempt counts. Rejected payloads (wrong shape, no code) don't, so a broken automation can't lock you out. When the limit trips it is logged as a warning; if you see one you didn't cause, someone with access to your broker is guessing your code. Tunable in a standalone `settings.js` via `securityDisarmMaxAttempts` and `securityDisarmAttemptWindowMs`; deliberately not an add-on option.
 
 The code is followed by a `#` keypress, which is what submits it — the panel otherwise just holds the digits and waits. This was confirmed on real hardware; Enter (`$0D`) had no effect. If your panel expects something else, please report it on [issue #51](https://github.com/dougrathbone/cgateweb/issues/51) with a log.
+
+### Measurement application (228)
+
+The C-Bus Measurement application (`$E4`) carries analogue/numeric readings — temperature, power, light level, energy, and more — keyed by **device + channel** rather than a group address, since a single measurement device can report several independent channels. See the official Clipsal spec (`CBUS-APP/28`) for the full 40-entry unit table.
+
+With `cbus_measurement_app_id` set (default off; typically `228`), cgateweb decodes `measurement data ...` broadcasts and publishes, per device/channel:
+
+- `cbus/read/{network}/228/{device}/{channel}/value` — the decoded reading (`raw × 10^multiplier`)
+- `cbus/read/{network}/228/{device}/{channel}/unit` — the unit string (e.g. `W`, `°C`, `lx`, `%`); empty if unitless or custom
+
+A Home Assistant `sensor` entity is auto-created per device/channel the first time it's seen, with `unit_of_measurement` and `device_class` (where the unit maps unambiguously to one — e.g. °C → temperature, W → power, Wh → energy, lx → illuminance, V → voltage, A → current, Pa → pressure, Hz → frequency) taken from the reading itself. Units the spec shares between quantities get no `device_class`: `%` covers humidity, tank levels, valve positions and any other ratio, so the entity is left as a plain percentage sensor rather than being announced as something it may not be. You can always set a device class yourself on the entity in Home Assistant.
+
+Energy readings (Wh) are published with `state_class: total_increasing` rather than `measurement`, which is what lets them be used in Home Assistant's Energy dashboard; every other unit uses `measurement`.
+
+Unlike Air Conditioning/Security, Measurement is not primarily about controlling hardware — a "measurement device" can just as easily be a script or virtual sensor as physical equipment (the specification itself defines devices as either "input units, which measure the quantities" or "output units, which display" them). So the same setting also enables the **write** path: publish a CSV payload of `value,multiplier,units` (e.g. `5042,0,38` for 5042 W) to `cbus/write/{network}/228/{device}/{channel}/data`, and cgateweb sends the native `MEASUREMENT DATA` command onto C-Bus — this is how a scripted or virtual sensor (e.g. reading a solar inverter's power output) gets its data onto the bus. Invalid values, multipliers, or unit codes are rejected with a warning rather than sent to C-Gate.
+
+Because injecting a reading isn't a hardware-actuation risk the way arming a panel or driving a thermostat is, there's no separate `*_control_enabled` flag here — `cbus_measurement_app_id` gates both directions.
 
 ## Networking
 

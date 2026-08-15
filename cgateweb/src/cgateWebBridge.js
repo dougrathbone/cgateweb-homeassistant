@@ -10,6 +10,7 @@ const ConnectionManager = require('./connectionManager');
 const EventPublisher = require('./eventPublisher');
 const AirconEventHandler = require('./airconEventHandler');
 const SecurityEventHandler = require('./securityEventHandler');
+const MeasurementEventHandler = require('./measurementEventHandler');
 const { LINE_UNPARSED } = require('./applicationDecoders/appEventLine');
 const path = require('path');
 const StateResyncCoordinator = require('./stateResyncCoordinator');
@@ -258,6 +259,16 @@ class CgateWebBridge {
             panelStateFile: this.settings.cbus_label_file
                 ? path.join(path.dirname(this.settings.cbus_label_file), 'security-panel-state.json')
                 : null
+        });
+
+        // Decodes native-measurement (app 228) event lines and publishes
+        // readings. Purely event-driven — the spec (§28.9) says measurement
+        // devices never respond to status requests, so there's no initial sync.
+        this.measurementEventHandler = new MeasurementEventHandler({
+            eventPublisher: this.eventPublisher,
+            logger: this.logger,
+            settings: this.settings,
+            getHaDiscovery: this._getHaDiscovery
         });
 
         // Republishes state after a Home Assistant or MQTT broker restart
@@ -632,7 +643,19 @@ class CgateWebBridge {
 
     _handleEventData(data) {
         this.eventLineProcessor.processData(data, (line) => {
-            this._processEventLine(line);
+            // Mirrors the try/catch on the command path. Without it a throw
+            // from any decoder reaches process.on('uncaughtException') in
+            // index.js, which stops the bridge and exits - LineProcessor
+            // deliberately re-throws with context, and CgateConnection emits
+            // 'data' synchronously, so nothing in between catches it. That put
+            // the two most complex and most externally-exposed parsers
+            // (aircon and security) on the one data path with no safety net,
+            // and C-Gate is unauthenticated on the LAN.
+            try {
+                this._processEventLine(line);
+            } catch (e) {
+                this.error(`Error processing event data line: ${e.message}`, { line: redactCgateLine(line) });
+            }
         });
     }
 
@@ -654,16 +677,29 @@ class CgateWebBridge {
         return this.securityEventHandler.handleLine(line);
     }
 
+    /**
+     * Delegates native-measurement (app 228) event-line handling to
+     * MeasurementEventHandler. Returns the handler's tri-state: true
+     * (consumed), LINE_UNPARSED (measurement traffic the handler didn't
+     * consume), or false (not measurement traffic).
+     */
+    _handleMeasurementLine(line) {
+        return this.measurementEventHandler.handleLine(line);
+    }
+
     _processEventLine(line) {
         // Security lines are `#`-comment-prefixed like aircon lines; consume
         // them before the generic comment-dropping branch so zone events don't
         // publish a bogus OFF and status reports don't warn-spam the parser.
-        // Both handlers classify the line exactly once and report a tri-state,
-        // which the unparsed branches below reuse instead of re-scanning.
+        // All three handlers classify the line exactly once and report a
+        // tri-state, which the unparsed branches below reuse instead of
+        // re-scanning.
         const airconState = this._handleAirconLine(line);
         if (airconState === true) return;
         const securityState = this._handleSecurityLine(line);
         if (securityState === true) return;
+        const measurementState = this._handleMeasurementLine(line);
+        if (measurementState === true) return;
 
         if (line.startsWith('#')) {
             this.logger.debug(`Ignoring comment from event port: ${redactCgateLine(line)}`);
@@ -705,6 +741,10 @@ class CgateWebBridge {
         }
         if (securityState === LINE_UNPARSED) {
             this.logger.debug(`Unparsed security line (captured, not a standard event): ${redactCgateLine(line)}`);
+            return;
+        }
+        if (measurementState === LINE_UNPARSED) {
+            this.logger.debug(`Unparsed measurement line (captured, not a standard event): ${line}`);
             return;
         }
 
@@ -778,8 +818,11 @@ class CgateWebBridge {
         this.logger.info(`C-Gate raw capture [app ${target.application}]: ${redactCgateLine(line)}`);
         try {
             this.mqttManager.publish(
+                // Redacted like the log line above. Redacting one and not the
+                // other was the original 1.24.3 miss: this publishes off-box to
+                // every broker subscriber, so it is the worse of the two (#51).
                 `cbus/read/${target.network}/${target.application}/${target.group}/raw`,
-                line,
+                redactCgateLine(line),
                 RAW_CAPTURE_MQTT_OPTIONS
             );
         } catch (e) {
@@ -793,8 +836,13 @@ class CgateWebBridge {
         try {
             await this.commandConnectionPool.execute(command);
         } catch (error) {
-            this.logger.error('Failed to send C-Gate command:', { command, error });
-            const trimmed = String(command || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+            // Redacted both here and in the published warning below: a failed
+            // send is exactly how a keypad command with a PIN digit ends up in
+            // the log and on the broker (#51). Logger redaction is key-name
+            // based, so `command` is not covered by it.
+            const safeCommand = redactCgateLine(String(command || ''));
+            this.logger.error('Failed to send C-Gate command:', { command: safeCommand, error });
+            const trimmed = safeCommand.replace(/\s+/g, ' ').trim().slice(0, 120);
             const detail = error && error.message ? error.message : String(error);
             this.mqttManager.publish(
                 'hello/cgateweb/warnings',

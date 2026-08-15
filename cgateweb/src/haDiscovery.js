@@ -85,6 +85,9 @@ class HaDiscovery {
         this._treeRetryInitialDelayMs = (settings && settings.haDiscoveryTreeRetryInitialDelayMs) || 2000;
         this._treeRetryMaxDelayMs = (settings && settings.haDiscoveryTreeRetryMaxDelayMs) || 60000;
         this._treeRequestTimeoutMs = (settings && settings.haDiscoveryTreeRequestTimeoutMs) || 8000;
+        // Defaults to the request timeout so existing installs see no change.
+        this._treeStreamStallMs = (settings && settings.haDiscoveryTreeStreamStallMs)
+            || this._treeRequestTimeoutMs;
 
         // Re-fetch budget for trees that were accepted (they carry device
         // data) but still contain units with empty <Groups> because C-Gate
@@ -119,6 +122,11 @@ class HaDiscovery {
         // event or status report) and from application-1 labels during tree
         // runs. Tracks "network/app/zone" keys already published this session.
         this._securityZoneSeen = new Set();
+
+        // Measurement (app 228) channels are discovered event-driven (first
+        // reading for that device/channel). Tracks "network/app/device/channel"
+        // keys already published this session.
+        this._measurementSeen = new Set();
 
         // Security panel-wide trouble sensors (mains, battery, tamper, panic,
         // phone line, arm failure, fire), announced as one group per network on

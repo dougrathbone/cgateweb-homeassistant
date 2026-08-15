@@ -3,7 +3,7 @@ const { EventEmitter } = require('events');
 const CBusCommand = require('./cbusCommand');
 const CoverRampTracker = require('./coverRampTracker');
 const { createLogger } = require('./logger');
-const { temperatureToCbusLevel } = require('./utils');
+const { temperatureToCbusLevel, redactMqttPayload } = require('./utils');
 const {
     MQTT_TOPIC_MANUAL_TRIGGER,
     MQTT_TOPIC_PREFIX_READ,
@@ -40,6 +40,8 @@ const {
     RAMP_STEP,
     NEWLINE,
     SECURITY_ARM_TOPIC_REGEX,
+    SECURITY_BYPASS_TOPIC_REGEX,
+    MEASUREMENT_DATA_TOPIC_REGEX,
     HVAC_MIN_TEMP_C,
     HVAC_MAX_TEMP_C
 } = require('./constants');
@@ -51,6 +53,9 @@ const {
     buildSetWardOff
 } = require('./airconControlRegistry');
 const { buildSecurityArmCommand, buildSecurityEmulateKeypadCommand } = require('./securityCommand');
+const { buildMeasurementDataCommand } = require('./measurementCommand');
+const RateLimiter = require('./web/rateLimiter');
+const { UNIT_TABLE: MEASUREMENT_UNIT_TABLE } = require('./applicationDecoders/measurementDecoder');
 
 // Upper bound on PIN length before we start typing at the panel. Alarm PINs are
 // 4-8 digits in practice; this is a sanity guard so a malformed payload cannot
@@ -125,10 +130,39 @@ class MqttCommandRouter extends EventEmitter {
         this._coverRampTracker = options.coverRampTracker
             || new CoverRampTracker(this.settings.coverRampUpdateIntervalMs || 500);
 
+        // Brute-force limit on disarm, keyed by network/application. Built
+        // lazily on first disarm so the settings object can be mutated after
+        // construction (which the tests and the add-on config reload both do).
+        this._disarmLimiter = null;
+
         this.logger = createLogger({
             component: 'MqttCommandRouter',
             level: 'info'
         });
+    }
+
+    /**
+     * Sliding-window limiter for disarm attempts. Shares the web API's
+     * implementation rather than repeating the window logic - see
+     * RateLimiter for why the eviction order there is worth having once.
+     *
+     * The tracked-key cap matters here too: an attacker can address any
+     * network/application pair, so without it the map would grow with each one
+     * tried. The pairs are already bounded by CBusEvent's range check on the
+     * read side and by the topic regex here, but the cap makes it explicit.
+     *
+     * @returns {RateLimiter}
+     * @private
+     */
+    _getDisarmLimiter() {
+        const maxRequests = this.settings.securityDisarmMaxAttempts ?? 10;
+        const windowMs = this.settings.securityDisarmAttemptWindowMs ?? 600000;
+        if (!this._disarmLimiter
+            || this._disarmLimiter.maxRequests !== maxRequests
+            || this._disarmLimiter.windowMs !== windowMs) {
+            this._disarmLimiter = new RateLimiter({ windowMs, maxRequests, maxTrackedSources: 256 });
+        }
+        return this._disarmLimiter;
     }
 
     /**
@@ -149,7 +183,8 @@ class MqttCommandRouter extends EventEmitter {
      */
     routeMessage(topic, payload) {
         if (this.logger.isLevelEnabled && this.logger.isLevelEnabled('debug')) {
-            this.logger.debug(`MQTT Recv: ${topic} -> ${payload}`);
+            // Redacted: a disarm payload carries the alarm PIN (#51).
+            this.logger.debug(`MQTT Recv: ${topic} -> ${redactMqttPayload(payload)}`);
         }
 
         // Handle manual HA discovery trigger
@@ -167,10 +202,33 @@ class MqttCommandRouter extends EventEmitter {
             return;
         }
 
+        // Security panel zone bypass (the virtual '#' keypad key, issue #42):
+        // same no-numeric-group shape as the arm topic.
+        const securityBypassMatch = topic.match(SECURITY_BYPASS_TOPIC_REGEX);
+        if (securityBypassMatch) {
+            this._handleSecurityBypass(securityBypassMatch[1], securityBypassMatch[2], topic);
+            return;
+        }
+
+        // Measurement data injection: the address is 4 segments
+        // (network/application/device/channel), so it can't parse as a
+        // CBusCommand either — routed directly like the security arm topic.
+        const measurementDataMatch = topic.match(MEASUREMENT_DATA_TOPIC_REGEX);
+        if (measurementDataMatch) {
+            this._handleMeasurementData(
+                measurementDataMatch[1], measurementDataMatch[2], measurementDataMatch[3], measurementDataMatch[4],
+                payload, topic
+            );
+            return;
+        }
+
         // Parse MQTT command
         const command = new CBusCommand(topic, payload);
         if (!command.isValid()) {
-            this.logger.warn(`Invalid MQTT command: ${topic} -> ${payload}`);
+            // Redacted, and this one matters most: it fires at the default log
+            // level, so a topic typo on a hand-built alarm card used to put the
+            // PIN into an ordinary log (#51).
+            this.logger.warn(`Invalid MQTT command: ${topic} -> ${redactMqttPayload(payload)}`);
             return;
         }
 
@@ -275,6 +333,16 @@ class MqttCommandRouter extends EventEmitter {
             return;
         }
 
+        if (action === 'ARM_CUSTOM_BYPASS') {
+            // Home Assistant's own alarm-panel action for "arm, bypassing what
+            // is in the way". On this panel that is exactly the '#' keypress,
+            // so it routes to the same place as the bypass button rather than
+            // being a second implementation. Reported on #62 by the user who
+            // was already driving it this way from his own project.
+            this._sendBypassKeypress(network, application, topic);
+            return;
+        }
+
         const mode = SECURITY_ARM_MODE_BY_PAYLOAD[action];
         if (mode === undefined) {
             // Deliberately quotes the action, never the payload: the payload may
@@ -286,6 +354,70 @@ class MqttCommandRouter extends EventEmitter {
         const cmd = buildSecurityArmCommand({ cbusname: this.cbusname, network, application, mode });
         this._queueCommand(cmd + NEWLINE);
         this.logger.info(`Security arm: ${network}/${application} -> ${mode} (${action})`);
+    }
+
+    /**
+     * Handles the zone-bypass button (cbus/write/{net}/{app}/panel/bypass).
+     * Sends the '#' keypress through `security emulate_keypad`, which is what
+     * the physical keypad uses to bypass open zones when arming stalls at
+     * arm_not_ready (#42). Gated on cbus_security_control_enabled like every
+     * other panel write, and additionally on cbus_security_bypass_enabled.
+     *
+     * @param {string} network
+     * @param {string} application
+     * @param {string} topic - For log context only.
+     * @private
+     */
+    _handleSecurityBypass(network, application, topic) {
+        if (!this.settings.cbus_security_control_enabled) {
+            this.logger.warn(`Security panel control is disabled (set cbus_security_control_enabled to enable); ignoring command on ${topic}`);
+            return;
+        }
+        const appId = this.settings.cbus_security_app_id;
+        if (!appId || String(appId) === '0' || String(application) !== String(appId)) {
+            this.logger.warn(`Security command for unconfigured application ${application} on topic ${topic}`);
+            return;
+        }
+
+        this._sendBypassKeypress(network, application, topic);
+    }
+
+    /**
+     * Send the '#' keypress that forces an arm past open zones.
+     *
+     * Shared by the two ways a user can reach it: the dedicated bypass button
+     * on its own topic, and Home Assistant's `arm_custom_bypass` action on the
+     * alarm panel itself (#62). Both end up here so the two cannot drift.
+     *
+     * The cbus_security_bypass_enabled check lives HERE rather than in the two
+     * callers, deliberately. Forcing an arm past an open zone is a different
+     * promise from arming - the alarm reports armed while that door is not
+     * actually covered - so it gets its own opt-in on top of control. Putting
+     * the check at the single point both routes funnel through means a future
+     * third caller cannot miss it, which is exactly how the first cut of this
+     * feature ended up ungated: the HA arm_custom_bypass action was added as a
+     * second entry point and inherited only the arm gate.
+     *
+     * Callers remain responsible for the control-enabled and application checks
+     * - both entry points already do them for their own error messages.
+     *
+     * @param {string} network
+     * @param {string} application
+     * @param {string} topic - For log context only.
+     * @returns {boolean} false if bypass is disabled and nothing was sent.
+     * @private
+     */
+    _sendBypassKeypress(network, application, topic) {
+        if (!this.settings.cbus_security_bypass_enabled) {
+            this.logger.warn(`Security zone bypass is disabled (set cbus_security_bypass_enabled to allow arming past open zones); ignoring command on ${topic}`);
+            return false;
+        }
+        const cmd = buildSecurityEmulateKeypadCommand({
+            cbusname: this.cbusname, network, application, key: SECURITY_KEYPAD_ACCEPT.charCodeAt(0)
+        });
+        this._queueCommand(cmd + NEWLINE);
+        this.logger.info(`Security zone bypass keypress (#) sent: ${network}/${application}`);
+        return true;
     }
 
     /**
@@ -357,6 +489,18 @@ class MqttCommandRouter extends EventEmitter {
             this.logger.warn(`Security disarm on ${topic} rejected: PIN longer than ${SECURITY_MAX_PIN_DIGITS} digits`);
             return;
         }
+        // Counted last, so a malformed payload cannot burn a real user's
+        // allowance - only a well-formed guess costs an attempt.
+        //
+        // Every attempt counts, right PIN or wrong: cgateweb cannot tell them
+        // apart, since only the panel judges the code and it answers with a
+        // broadcast rather than a reply. Guessing that from the state machine
+        // would mean the limiter could be reset by anything that looked like a
+        // disarm, which is the wrong way for that to fail.
+        if (this._getDisarmLimiter().isLimitedByKey(`${network}/${application}`)) {
+            this.logger.warn(`Security disarm on ${topic} rejected: too many disarm attempts for ${network}/${application}; refusing further PIN entry for now. If this was not you, someone is guessing your alarm code over MQTT.`);
+            return;
+        }
 
         // The digits, then the accept key. Without the terminator the panel
         // holds the digits and waits, so 1.24.0's disarm looked like it did
@@ -376,6 +520,49 @@ class MqttCommandRouter extends EventEmitter {
         // Digit count, never the digits. Enough to confirm the keypresses went
         // out and to spot a truncated PIN, without putting it in the log.
         this.logger.info(`Security disarm: ${network}/${application} -> sent ${code.length} digits + accept key`);
+    }
+
+    /**
+     * Handles a Measurement application (228/$E4) data-injection command:
+     * "cbus/write/{net}/{app}/{device}/{channel}/data" with payload
+     * "value,multiplier,units" (confirmed working format via live end-to-end
+     * testing against real C-Gate). This is how a scripted/virtual measurement
+     * source (e.g. a solar inverter reading) gets onto the bus — not a
+     * hardware-control write, so it shares the single cbus_measurement_app_id
+     * gate with the read path rather than needing a separate *_control_enabled
+     * flag (unlike Air Conditioning/Security, which drive real plant/panels).
+     * @private
+     */
+    _handleMeasurementData(network, application, device, channel, payload, topic) {
+        const appId = this.settings.cbus_measurement_app_id;
+        if (!appId || String(application) !== String(appId)) {
+            this.logger.warn(`Measurement data command for unconfigured application ${application} on topic ${topic}`);
+            return;
+        }
+
+        const parts = String(payload).split(',');
+        const value = parseInt(parts[0], 10);
+        const multiplier = parts.length > 1 ? parseInt(parts[1], 10) : 0;
+        const unitsCode = parts.length > 2 ? parseInt(parts[2], 10) : 0; // default $00 (°C)
+
+        if (!Number.isInteger(value) || value < -32768 || value > 32767) {
+            this.logger.warn(`Invalid measurement value "${parts[0]}" on topic ${topic} (expected an integer, -32768..32767)`);
+            return;
+        }
+        if (!Number.isInteger(multiplier) || multiplier < -128 || multiplier > 127) {
+            this.logger.warn(`Invalid measurement multiplier "${parts[1]}" on topic ${topic} (expected an integer, -128..127)`);
+            return;
+        }
+        if (!Number.isInteger(unitsCode) || !Object.prototype.hasOwnProperty.call(MEASUREMENT_UNIT_TABLE, unitsCode)) {
+            this.logger.warn(`Unknown measurement units code "${parts[2]}" on topic ${topic} (see docs/Measurement Application.md §28.5.1.2)`);
+            return;
+        }
+
+        const cmd = buildMeasurementDataCommand({
+            cbusname: this.cbusname, network, application, device, channel, value, multiplier, unitsCode
+        });
+        this._queueCommand(cmd + NEWLINE);
+        this.logger.info(`Measurement data: ${network}/${application}/${device}/${channel} -> ${value} x 10^${multiplier} (units ${unitsCode})`);
     }
 
     /**
