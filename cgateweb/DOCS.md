@@ -669,7 +669,23 @@ To read native thermostat data from the real C-Bus Air Conditioning application,
 - `cbus/read/{network}/172/{sourceUnit}/current_humidity`, `/humidity_mode`, `/humidity_setpoint`, `/humidity_action` — humidity application state (spec-derived; only present on installs with humidity plant)
 - `cbus/read/{network}/172/{sourceUnit}/comfort_level` — evaporative comfort level (only for evaporative plant cooling)
 
-Topics are keyed by **source unit** (the thermostat's unit address, e.g. `201`) rather than zone group, so installations with multiple thermostats sharing a zone group are correctly handled. An HA `climate` entity (with fan mode and humidity state) plus `Plant problem` and `Temperature sensor problem` binary_sensors are auto-created per thermostat.
+Topics are keyed by **source unit** (the thermostat's unit address, e.g. `201`) rather than zone group, so installations with multiple thermostats sharing a zone group are correctly handled.
+
+Each thermostat gets a `climate` entity (with fan mode and humidity state), `Plant problem` and `Temperature sensor problem` binary_sensors, and a set of diagnostic entities grouped under Diagnostics on the same device:
+
+| Entity | Type | What it shows |
+|---|---|---|
+| `Damper` | binary_sensor | Whether the zone damper is open (spec §25.6.6 bit 3) |
+| `Plant busy` | binary_sensor | The plant is settling and may not act on a change yet |
+| `Plant type` | sensor | What the reporting plant is — heat pump, evaporative, and so on |
+| `Plant error` | sensor | The plant's error description, or none |
+| `Temperature sensor status` | sensor | Whether the zone's temperature sensor is healthy |
+| `Fan speed setting` | sensor | The commanded fan speed |
+| `Fan output` | sensor | Fan output as a percentage, where the plant reports one |
+| `Comfort level` | sensor | Evaporative comfort level |
+| `Humidity mode` / `Humidity action` | sensor | Humidifier mode and what it is currently doing |
+
+These are read-only and appear regardless of `cbus_aircon_control_enabled`. Several are only populated by plant that reports them — comfort level and fan output come from evaporative systems, and the humidity pair from humidity-capable plant — so an entity that stays empty means your hardware does not broadcast that field, not that something is wrong.
 
 Control is **opt-in** via `cbus_aircon_control_enabled` (off by default — it writes to live heating/cooling). When enabled: publish a target in °C to `cbus/write/{network}/172/{sourceUnit}/setpoint`, a mode (`off`/`heat`/`cool`/`auto`/`fan_only`) to `cbus/write/{network}/172/{sourceUnit}/hvacmode`, or a fan mode (`automatic`/`continuous`) to `cbus/write/{network}/172/{sourceUnit}/fanmode`. Setpoint writes are debounced to one command per 3s per the protocol's anti-echo guidance, and the thermostat's own flags, per-mode setpoints, and fan state are learned and echoed on writes.
 
@@ -691,7 +707,9 @@ Alongside the zone sensors, cgateweb publishes one `alarm_control_panel` entity 
 - `cbus/read/{network}/208/panel/state` — the HA alarm state: `disarmed`, `armed_away`, `armed_home`, `armed_night`, `armed_vacation`, `arming`, `pending`, `triggered`
 - `cbus/read/{network}/208/panel/attributes` — JSON attributes; while the panel refuses to arm, the blocking zone appears as `blocking_zone`
 
-The state machine follows the panel's broadcasts: `system_arm` sets the armed mode (C-Bus day/stay mode 3 maps to `armed_home`), `exit_delay_started` shows `arming`, `arm_not_ready` shows `pending` with the blocking zone, `arm_ready` returns to `disarmed`, `alarm_on` shows `triggered` and `alarm_off` reverts to the pre-alarm state.
+The state machine follows the panel's broadcasts: `system_arm` sets the armed mode (C-Bus day/stay mode 3 maps to `armed_home`), `exit_delay_started` shows `arming`, `entry_delay_started` shows `pending`, `arm_not_ready` stays `disarmed` and names the blocking zone in the attributes, `arm_ready` returns to `disarmed`, `alarm_on` shows `triggered` and `alarm_off` reverts to the armed state the panel was in.
+
+`pending` means an entry delay is running — someone opened a delay zone while the alarm was armed and the siren follows unless it is disarmed in time. That is the state worth automating on. It is **not** used for a refused arm: a panel that will not arm because a window is open is still disarmed, and saying otherwise would fire intruder automations at whoever was trying to arm it.
 
 With `cbus_security_control_enabled: true` (off by default) the entity gains a command topic, `cbus/write/{network}/208/panel/arm`, and Home Assistant's **arm** buttons work: `ARM_AWAY` → `away`, `ARM_NIGHT` → `night`, `ARM_HOME` → `day` (day/stay), `ARM_VACATION` → `vacation`. These are C-Gate's own arm-mode keywords (C-Gate manual §4.5.177); the numeric mode values in the C-Bus application spec are not accepted by the command interface and are rejected with `405 Parameter out of range`. The panel confirms with a `system_arm` broadcast, so the displayed state always comes from the panel itself.
 
@@ -699,7 +717,7 @@ With `cbus_security_control_enabled: true` (off by default) the entity gains a c
 
 #### Bypassing open zones
 
-When arming stalls at `pending` because a zone is open (`arm_not_ready` names it in the attributes), the physical keypad's `#` key bypasses the open zones and lets the arm continue.
+When arming is refused because a zone is open (`arm_not_ready` names it in the attributes and the panel stays `disarmed`), the physical keypad's `#` key bypasses the open zones and lets the arm continue.
 
 This is a **third** opt-in, `cbus_security_bypass_enabled: true`, on top of `cbus_security_control_enabled`. It is separate from arming because it makes a different promise: an alarm armed past an open door reports **armed** to you and to Home Assistant, while that door is not actually covered. Turning on arming should not quietly hand out "arm anyway" as well.
 
