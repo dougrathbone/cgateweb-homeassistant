@@ -13,6 +13,9 @@ const {
     MQTT_CMD_TYPE_HVAC_SETPOINT,
     MQTT_CMD_TYPE_HVAC_MODE,
     MQTT_CMD_TYPE_HVAC_FAN_MODE,
+    MQTT_CMD_TYPE_TEMPERATURE,
+    MQTT_CMD_TYPE_PLAY,
+    MQTT_CMD_TYPE_RECORD,
     MQTT_STATE_ON,
     MQTT_STATE_OFF,
     MQTT_COMMAND_STOP,
@@ -39,7 +42,10 @@ const VALID_COMMAND_TYPES = new Set([
     MQTT_CMD_TYPE_TRIGGER,        // Fire a C-Bus trigger group
     MQTT_CMD_TYPE_HVAC_SETPOINT,  // HVAC temperature setpoint
     MQTT_CMD_TYPE_HVAC_MODE,      // HVAC operating mode
-    MQTT_CMD_TYPE_HVAC_FAN_MODE   // HVAC fan mode
+    MQTT_CMD_TYPE_HVAC_FAN_MODE,  // HVAC fan mode
+    MQTT_CMD_TYPE_TEMPERATURE,    // Temperature Broadcast inject
+    MQTT_CMD_TYPE_PLAY,           // Scene Module play
+    MQTT_CMD_TYPE_RECORD          // Scene Module record
 ]);
 
 /**
@@ -180,7 +186,10 @@ class CBusCommand {
             case MQTT_CMD_TYPE_HVAC_SETPOINT:
             case MQTT_CMD_TYPE_HVAC_MODE:
             case MQTT_CMD_TYPE_HVAC_FAN_MODE:
-                // HVAC commands: payload is used as-is by the command router
+            case MQTT_CMD_TYPE_TEMPERATURE:
+            case MQTT_CMD_TYPE_PLAY:
+            case MQTT_CMD_TYPE_RECORD:
+                // Payload is used as-is by the command router
                 break;
             case MQTT_CMD_TYPE_GETALL:
             case MQTT_CMD_TYPE_GETTREE:
