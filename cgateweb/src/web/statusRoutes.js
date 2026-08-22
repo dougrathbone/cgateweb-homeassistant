@@ -1,6 +1,8 @@
 // @ts-check
 const http = require('http');
 const { sendJSON } = require('./httpHelpers');
+const { supervisorRequest } = require('../supervisorHttp');
+const { resolveSetting } = require('../config/schema');
 
 /**
  * Route handlers for bridge status, dashboard, HA areas, and health probes.
@@ -14,8 +16,10 @@ class StatusRoutes {
      * @param {Object|null} [options.eventStream] - Event stream instance
      * @param {number} options.activeDeviceWindowMs - Window for counting active devices
      * @param {number} options.haAreasCacheTtlMs - Cache TTL for Home Assistant areas
-     * @param {number} options.haApiTimeoutMs - Timeout for Home Assistant API calls
-     * @param {Object} options.logger - Logger instance
+ * @param {number} options.haApiTimeoutMs - Timeout for Home Assistant API calls
+ * @param {number} [options.maxDashboardDevices] - Cap on dashboard device rows
+ * @param {Object} options.logger - Logger instance
+     * @param {typeof http} [options.httpModule] - Injectable http module (tests)
      */
     constructor({
         getStatus,
@@ -25,7 +29,9 @@ class StatusRoutes {
         activeDeviceWindowMs,
         haAreasCacheTtlMs,
         haApiTimeoutMs,
-        logger
+        maxDashboardDevices,
+        logger,
+        httpModule = http
     }) {
         this.getStatus = getStatus;
         this.labelLoader = labelLoader;
@@ -34,7 +40,11 @@ class StatusRoutes {
         this.activeDeviceWindowMs = activeDeviceWindowMs;
         this.haAreasCacheTtlMs = haAreasCacheTtlMs;
         this.haApiTimeoutMs = haApiTimeoutMs;
+        this.maxDashboardDevices = Number.isFinite(maxDashboardDevices) && maxDashboardDevices > 0
+            ? maxDashboardDevices
+            : resolveSetting({}, 'webDashboardMaxDevices');
         this.logger = logger;
+        this._http = httpModule;
         this._haAreasCache = null;
         this._haAreasCacheTime = 0;
     }
@@ -48,8 +58,7 @@ class StatusRoutes {
         sendJSON(res, 200, {
             ...status,
             labels: {
-                count: Object.keys(labels).length,
-                filePath: this.labelLoader.filePath
+                count: Object.keys(labels).length
             }
         });
     }
@@ -62,7 +71,6 @@ class StatusRoutes {
         const labels = this.labelLoader.getLabelsObject();
         const labelCount = Object.keys(labels).length;
 
-        // Build device list from device state manager
         const devices = [];
         if (this.deviceStateManager) {
             const allLastSeen = this.deviceStateManager.getAllLastSeen();
@@ -81,7 +89,6 @@ class StatusRoutes {
             devices.sort((a, b) => b.lastSeen - a.lastSeen);
         }
 
-        // Recent events from event stream
         const recentEvents = this.eventStream
             ? this.eventStream.getRecent().slice(-50)
             : [];
@@ -100,9 +107,50 @@ class StatusRoutes {
             devices: {
                 total: devices.length,
                 active: devices.filter(d => d.lastSeen > Date.now() - this.activeDeviceWindowMs).length,
-                list: devices.slice(0, 200)
+                list: devices.slice(0, this.maxDashboardDevices)
             },
             recentEvents: recentEvents.length
+        });
+    }
+
+    /**
+     * Fetch Home Assistant area names via the Supervisor template API.
+     * Resolves null on transport/parse failure so the caller can skip caching.
+     * @param {string} supervisorToken
+     * @returns {Promise<Array<{name: string, source: string}>|null>}
+     */
+    _fetchHaAreas(supervisorToken) {
+        const tmpl = '{{ areas() | map("area_name") | list | to_json }}';
+        const postBody = JSON.stringify({ template: tmpl });
+        return supervisorRequest({
+            method: 'POST',
+            url: 'http://supervisor/core/api/template',
+            token: supervisorToken,
+            httpModule: this._http,
+            timeoutMs: this.haApiTimeoutMs,
+            body: postBody
+        }).then(({ statusCode, body }) => {
+            this.logger.debug(`Area API HTTP ${statusCode}, body length: ${body.length}`);
+            let data;
+            try { data = JSON.parse(body); } catch { return null; }
+            if (!Array.isArray(data)) {
+                return null;
+            }
+            const haAreas = [];
+            for (const name of data) {
+                if (typeof name === 'string' && name) {
+                    haAreas.push({ name, source: 'homeassistant' });
+                }
+            }
+            this.logger.debug(`Area template response: count=${haAreas.length}`);
+            return haAreas;
+        }).catch((e) => {
+            if (e && e.message === 'Timeout') {
+                this.logger.warn('Area API request timeout');
+            } else {
+                this.logger.warn(`Area API request error: ${e && e.message}`);
+            }
+            return null;
         });
     }
 
@@ -111,7 +159,6 @@ class StatusRoutes {
      * areas fetched from the Supervisor API (cached).
      */
     async handleGetAreas(_req, res) {
-        // Collect areas from label file
         const labelAreas = new Set();
         if (this.labelLoader) {
             const areasMap = this.labelLoader.getLabelData?.()?.areas;
@@ -123,7 +170,6 @@ class StatusRoutes {
             }
         }
 
-        // Fetch areas from Home Assistant Supervisor API (cached 30s)
         let haAreas = [];
         const supervisorToken = process.env.SUPERVISOR_TOKEN;
         if (supervisorToken) {
@@ -132,47 +178,18 @@ class StatusRoutes {
                 haAreas = this._haAreasCache;
             } else {
                 try {
-                    const data = await new Promise((resolve) => {
-                        const tmpl = '{{ areas() | map("area_name") | list | to_json }}';
-                        const postBody = JSON.stringify({ template: tmpl });
-                        const req = http.request('http://supervisor/core/api/template', {
-                            method: 'POST',
-                            headers: {
-                                'Authorization': `Bearer ${supervisorToken}`,
-                                'Content-Type': 'application/json',
-                                'Content-Length': Buffer.byteLength(postBody)
-                            },
-                            timeout: this.haApiTimeoutMs
-                        }, (resp) => {
-                            let body = '';
-                            resp.on('data', (chunk) => { body += chunk; });
-                            resp.on('end', () => {
-                                this.logger.debug(`Area API HTTP ${resp.statusCode}, body length: ${body.length}`);
-                                try { resolve(JSON.parse(body)); } catch { resolve(null); }
-                            });
-                        });
-                        req.on('error', (e) => { this.logger.warn('Area API request error:', e.message); resolve(null); });
-                        req.on('timeout', () => { this.logger.warn('Area API request timeout'); req.destroy(); resolve(null); });
-                        req.write(postBody);
-                        req.end();
-                    });
-                    this.logger.debug(`Area template response: isArray=${Array.isArray(data)}, count=${Array.isArray(data) ? data.length : 0}`);
-                    if (Array.isArray(data)) {
-                        for (const name of data) {
-                            if (typeof name === 'string' && name) {
-                                haAreas.push({ name, source: 'homeassistant' });
-                            }
-                        }
+                    const fetched = await this._fetchHaAreas(supervisorToken);
+                    if (fetched) {
+                        haAreas = fetched;
                         this._haAreasCache = haAreas;
                         this._haAreasCacheTime = now;
                     }
                 } catch (err) {
-                    this.logger.warn('Failed to fetch HA areas:', err.message || err);
+                    this.logger.warn(`Failed to fetch HA areas: ${err.message || err}`);
                 }
             }
         }
 
-        // Merge: HA areas + label-file areas, deduplicated by name (case-insensitive)
         const seen = new Set();
         const merged = [];
         for (const ha of haAreas) {

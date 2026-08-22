@@ -2,10 +2,11 @@
 const fs = require('fs');
 const { Logger } = require('../logger');
 const EnvironmentDetector = require('./EnvironmentDetector');
-const { listKnownConfigKeys, listSettingAliases, getSchemaEntry } = require('./schema');
+const { listKnownConfigKeys, listSettingAliases, getSchemaEntry, resolveSetting } = require('./schema');
 const { DEFAULT_ADDON_LABEL_FILE, LEGACY_ADDON_LABEL_FILE, DEFAULT_ADDON_DATA_LABEL_FILE } = require('../constants');
-const { isPortInRange, isValidCgateProjectName, isValidCgateUsername, isValidCgatePassword } = require('./validationRules');
+const { isPortInRange, isValidCgateProjectName, isValidCgateUsername, isValidCgatePassword, normalizeOptionalSecret } = require('./validationRules');
 const { applyAddonOptionMap } = require('./addonOptionMap');
+const { supervisorJson } = require('../supervisorHttp');
 
 const DEFAULT_MQTT_VALUES = ['core-mosquitto:1883', '127.0.0.1:1883', undefined, null, ''];
 
@@ -60,7 +61,7 @@ class ConfigLoader {
         try {
             const optionsData = fs.readFileSync(optionsPath, 'utf8');
             addonOptions = JSON.parse(optionsData);
-            this.logger.debug('Loaded addon options from:', optionsPath);
+            this.logger.debug(`Loaded addon options from: ${optionsPath}`);
         } catch (error) {
             throw new Error(`Failed to parse addon options: ${error.message}`, { cause: error });
         }
@@ -93,7 +94,7 @@ class ConfigLoader {
             delete require.cache[require.resolve(settingsPath)];
             
             const settings = require(settingsPath);
-            this.logger.debug('Loaded settings from:', settingsPath);
+            this.logger.debug(`Loaded settings from: ${settingsPath}`);
             
             const config = this._convertSettingsToStandardFormat(settings);
             
@@ -105,7 +106,7 @@ class ConfigLoader {
 
             return config;
         } catch (error) {
-            this.logger.error('Failed to load settings.js:', error.message);
+            this.logger.error(`Failed to load settings.js: ${error.message}`);
             const allowFallback = String(process.env.ALLOW_DEFAULT_FALLBACK || '').toLowerCase() === 'true';
             if (!allowFallback) {
                 throw new Error(
@@ -269,6 +270,7 @@ class ConfigLoader {
             config.web_allowed_origins = options.web_allowed_origins.filter((origin) => typeof origin === 'string' && origin.trim() !== '');
         }
 
+        this._trimSecretFields(config);
         return config;
     }
 
@@ -347,6 +349,7 @@ class ConfigLoader {
             config.cbus_aircon_control_enabled = config.cbus_aircon_control_enabled.toLowerCase() === 'true';
         }
 
+        this._trimSecretFields(config);
         return config;
     }
 
@@ -457,6 +460,7 @@ class ConfigLoader {
      * @returns {Promise<Object>} settings with MQTT fields populated (mutated in place)
      */
     async applyMqttAutoDetection(settings) {
+        this._trimSecretFields(settings);
         const mqttConfig = await this.detectMqttConfig();
         if (!mqttConfig) {
             const hasDefaultBroker = DEFAULT_MQTT_VALUES.includes(settings.mqtt);
@@ -489,6 +493,21 @@ class ConfigLoader {
     }
 
     /**
+     * Trim MQTT/C-Gate username and password fields. Blank after trim is
+     * treated as unset so a padded HA password field cannot become a secret
+     * (same rule as web_api_key).
+     * @param {Object} settings
+     * @private
+     */
+    _trimSecretFields(settings) {
+        if (!settings || typeof settings !== 'object') return;
+        for (const key of ['mqttusername', 'mqttpassword', 'cgateusername', 'cgatepassword']) {
+            if (!Object.prototype.hasOwnProperty.call(settings, key)) continue;
+            settings[key] = normalizeOptionalSecret(settings[key]);
+        }
+    }
+
+    /**
      * Attempt to auto-detect MQTT credentials from HA Supervisor API.
      * Returns null if not available or if detection fails.
      */
@@ -499,23 +518,11 @@ class ConfigLoader {
         }
 
         try {
-            const http = this._httpGet || require('http');
-            const data = await new Promise((resolve, reject) => {
-                const req = http.get('http://supervisor/services/mqtt', {
-                    headers: { 'Authorization': `Bearer ${supervisorToken}` }
-                }, (res) => {
-                    let body = '';
-                    res.on('data', chunk => { body += chunk; });
-                    res.on('end', () => {
-                        if (res.statusCode === 200) {
-                            resolve(JSON.parse(body));
-                        } else {
-                            reject(new Error(`Supervisor API returned ${res.statusCode}`));
-                        }
-                    });
-                });
-                req.on('error', reject);
-                req.setTimeout(5000, () => { req.destroy(); reject(new Error('Timeout')); });
+            const data = await supervisorJson({
+                url: 'http://supervisor/services/mqtt',
+                token: supervisorToken,
+                httpModule: this._httpGet || require('http'),
+                timeoutMs: resolveSetting({}, 'supervisorMqttDetectTimeoutMs')
             });
 
             if (data && data.data) {
@@ -530,7 +537,7 @@ class ConfigLoader {
                 };
             }
         } catch (error) {
-            this.logger.debug('MQTT auto-detection unavailable:', error.message);
+            this.logger.debug(`MQTT auto-detection unavailable: ${error.message}`);
         }
 
         return null;
@@ -613,7 +620,7 @@ class ConfigLoader {
         }
 
         if (errors.length > 0) {
-            this.logger.error('Configuration validation failed:', errors);
+            this.logger.error(`Configuration validation failed: ${errors.join(', ')}`);
             throw new Error(`Configuration validation failed: ${errors.join(', ')}`);
         }
 

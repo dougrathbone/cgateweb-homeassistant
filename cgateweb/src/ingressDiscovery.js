@@ -1,6 +1,7 @@
 // @ts-check
-const httpDefault = require('http');
 const { backoffDelay } = require('./backoff');
+const { resolveSetting } = require('./config/schema');
+const { supervisorJson } = require('./supervisorHttp');
 
 /**
  * Fetch this add-on's own info from the Supervisor API. Every installed add-on
@@ -10,30 +11,15 @@ const { backoffDelay } = require('./backoff');
  *
  * @param {Object} options
  * @param {string} [options.token] - Supervisor token
- * @param {typeof httpDefault} [options.httpModule] - http implementation override (testing)
- * @param {number} [options.timeoutMs=5000] - per-request timeout
+ * @param {Object} [options.httpModule] - http implementation override (testing)
+ * @param {number} [options.timeoutMs] - per-request timeout
  */
-function _fetchAddonInfo({ token, httpModule = httpDefault, timeoutMs = 5000 } = {}) {
-    return new Promise((resolve, reject) => {
-        const req = httpModule.get('http://supervisor/addons/self/info', {
-            headers: { 'Authorization': `Bearer ${token}` }
-        }, (res) => {
-            let body = '';
-            res.on('data', (chunk) => { body += chunk; });
-            res.on('end', () => {
-                if (res.statusCode !== 200) {
-                    reject(new Error(`Supervisor API returned ${res.statusCode}`));
-                    return;
-                }
-                try {
-                    resolve(JSON.parse(body));
-                } catch (err) {
-                    reject(new Error(`Invalid Supervisor API response: ${err.message}`));
-                }
-            });
-        });
-        req.on('error', reject);
-        req.setTimeout(timeoutMs, () => { req.destroy(); reject(new Error('Timeout')); });
+function _fetchAddonInfo({ token, httpModule, timeoutMs } = {}) {
+    return supervisorJson({
+        url: 'http://supervisor/addons/self/info',
+        token,
+        httpModule,
+        timeoutMs
     });
 }
 
@@ -47,20 +33,33 @@ function _fetchAddonInfo({ token, httpModule = httpDefault, timeoutMs = 5000 } =
  *
  * @param {object} [options]
  * @param {string} [options.token] - the SUPERVISOR_TOKEN injected into the add-on container
- * @param {typeof httpDefault} [options.httpModule] - http implementation override (testing)
- * @param {number} [options.timeoutMs=5000] - per-request timeout
- * @param {number} [options.attempts=4] - total attempts before giving up
- * @param {number} [options.initialRetryDelayMs=1000] - base delay for the retry backoff
+ * @param {typeof import('http')} [options.httpModule] - http implementation override (testing)
+ * @param {number} [options.timeoutMs] - per-request timeout (schema: ingressDiscoveryTimeoutMs)
+ * @param {number} [options.attempts] - total attempts before giving up (schema: ingressDiscoveryAttempts)
+ * @param {number} [options.initialRetryDelayMs] - base delay for the retry backoff (schema: ingressDiscoveryInitialRetryDelayMs)
+ * @param {number} [options.maxRetryDelayMs] - ceiling for the retry backoff (schema: ingressDiscoveryMaxBackoffMs)
  * @param {Function} [options.sleep] - sleep implementation override (testing)
  * @returns {Promise<string|null>} the ingress entry path, or null when it could not be determined
  */
-async function discoverIngressEntry({ token, httpModule, timeoutMs, attempts = 4, initialRetryDelayMs = 1000, sleep } = {}) {
+async function discoverIngressEntry({ token, httpModule, timeoutMs, attempts, initialRetryDelayMs, maxRetryDelayMs, sleep } = {}) {
     if (!token) return null;
     const doSleep = sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+    const resolvedTimeoutMs = timeoutMs !== undefined
+        ? timeoutMs
+        : resolveSetting({}, 'ingressDiscoveryTimeoutMs');
+    const resolvedAttempts = attempts !== undefined
+        ? attempts
+        : resolveSetting({}, 'ingressDiscoveryAttempts');
+    const resolvedInitialRetryDelayMs = initialRetryDelayMs !== undefined
+        ? initialRetryDelayMs
+        : resolveSetting({}, 'ingressDiscoveryInitialRetryDelayMs');
+    const maxMs = maxRetryDelayMs !== undefined
+        ? maxRetryDelayMs
+        : resolveSetting({}, 'ingressDiscoveryMaxBackoffMs');
 
-    for (let attempt = 1; attempt <= attempts; attempt++) {
+    for (let attempt = 1; attempt <= resolvedAttempts; attempt++) {
         try {
-            const info = await _fetchAddonInfo({ token, httpModule, timeoutMs });
+            const info = await _fetchAddonInfo({ token, httpModule, timeoutMs: resolvedTimeoutMs });
             const entry = info && info.data && typeof info.data.ingress_entry === 'string'
                 ? info.data.ingress_entry.trim()
                 : '';
@@ -69,8 +68,8 @@ async function discoverIngressEntry({ token, httpModule, timeoutMs, attempts = 4
             }
             throw new Error('Supervisor response did not include an ingress entry path');
         } catch {
-            if (attempt >= attempts) break;
-            await doSleep(backoffDelay(attempt - 1, { initialMs: initialRetryDelayMs, maxMs: 8000 }));
+            if (attempt >= resolvedAttempts) break;
+            await doSleep(backoffDelay(attempt - 1, { initialMs: resolvedInitialRetryDelayMs, maxMs }));
         }
     }
 

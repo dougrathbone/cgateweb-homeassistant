@@ -9,9 +9,10 @@ const {
     MQTT_TOPIC_STATUS,
     MQTT_PAYLOAD_STATUS_ONLINE,
     MQTT_PAYLOAD_STATUS_OFFLINE,
-    MQTT_ERROR_AUTH,
-    HA_DISCOVERY_PREFIX_DEFAULT
+    MQTT_ERROR_AUTH
 } = require('./constants');
+const { resolveSetting } = require('./config/schema');
+const { normalizeOptionalSecret } = require('./config/validationRules');
 
 /**
  * Manages MQTT broker connection and message handling for the C-Bus bridge.
@@ -79,7 +80,7 @@ class MqttManager extends EventEmitter {
         // entry is evicted.
         this._pendingPublishQueue = new Map();
         this._pendingPublishMaxEntries = Math.max(
-            10, Number(settings && settings.mqttPendingPublishMaxEntries) || 1000
+            10, resolveSetting(settings || {}, 'mqttPendingPublishMaxEntries')
         );
         this._pendingPublishEvicted = 0;
 
@@ -221,7 +222,7 @@ class MqttManager extends EventEmitter {
     }
 
     _buildMqttUrl() {
-        const raw = this.settings.mqtt || 'localhost:1883';
+        const raw = resolveSetting(this.settings, 'mqtt');
         
         // If URL already has a protocol, use it directly
         if (/^mqtts?:\/\//.test(raw)) {
@@ -239,8 +240,8 @@ class MqttManager extends EventEmitter {
     _buildConnectOptions() {
         /** @type {import('mqtt').IClientOptions} */
         const options = {
-            reconnectPeriod: this.settings.mqttReconnectPeriodMs || 5000,
-            connectTimeout: this.settings.mqttConnectTimeoutMs || 30000,
+            reconnectPeriod: resolveSetting(this.settings, 'mqttReconnectPeriodMs'),
+            connectTimeout: resolveSetting(this.settings, 'mqttConnectTimeoutMs'),
             will: {
                 topic: MQTT_TOPIC_STATUS,
                 payload: MQTT_PAYLOAD_STATUS_OFFLINE,
@@ -249,11 +250,12 @@ class MqttManager extends EventEmitter {
             }
         };
 
-        if (this.settings.mqttusername && typeof this.settings.mqttusername === 'string') {
-            options.username = this.settings.mqttusername;
-            
-            if (this.settings.mqttpassword && typeof this.settings.mqttpassword === 'string') {
-                options.password = this.settings.mqttpassword;
+        const username = normalizeOptionalSecret(this.settings.mqttusername);
+        if (username) {
+            options.username = username;
+            const password = normalizeOptionalSecret(this.settings.mqttpassword);
+            if (password) {
+                options.password = password;
             }
         }
 
@@ -352,9 +354,10 @@ class MqttManager extends EventEmitter {
      */
     get haStatusTopic() {
         if (this._haStatusTopic === null) {
-            this._haStatusTopic = this.settings.haStatusTopic
-                ? String(this.settings.haStatusTopic)
-                : `${this.settings.ha_discovery_prefix || HA_DISCOVERY_PREFIX_DEFAULT}/status`;
+            const configured = resolveSetting(this.settings, 'haStatusTopic');
+            this._haStatusTopic = (configured !== null && configured !== '')
+                ? String(configured)
+                : `${resolveSetting(this.settings, 'ha_discovery_prefix')}/status`;
         }
         return this._haStatusTopic;
     }

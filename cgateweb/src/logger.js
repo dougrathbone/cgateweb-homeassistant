@@ -68,7 +68,7 @@ class Logger {
             coloredLevel = `${colors[level.toUpperCase()] || ''}${levelStr}${reset}`;
         }
         
-        let logLine = `${timestamp} ${coloredLevel} ${componentStr} ${message}`;
+        let logLine = `${timestamp} ${coloredLevel} ${componentStr} ${this._toSingleLine(message)}`;
 
         // Enhanced metadata formatting for development
         if (Object.keys(meta).length > 0) {
@@ -92,6 +92,40 @@ class Logger {
     }
 
     /**
+     * Accept a string (or array) as the second argument without treating it
+     * as metadata. Callers historically wrote logger.warn('text:', err.message)
+     * and Object.keys on a string produced per-character keys plus a stray
+     * JSON blob. Fold those into the message so _toSingleLine sanitizes them.
+     * @private
+     */
+    _coerceLogArgs(message, meta) {
+        if (meta === undefined || meta === null) {
+            return [message, {}];
+        }
+        if (typeof meta === 'object' && !Array.isArray(meta)) {
+            return [message, meta];
+        }
+        const extra = typeof meta === 'string' ? meta : JSON.stringify(meta);
+        return [`${message} ${extra}`, {}];
+    }
+
+    /**
+     * Collapse a message onto one line.
+     *
+     * Plenty of what gets logged here started life outside the process: a
+     * C-Gate response line, an MQTT topic, the message of a socket error. A
+     * line break in any of those lets the remote end append what looks like a
+     * whole extra log entry (CWE-117), so breaks become a visible separator
+     * and the result is then stripped of anything that still parses as one.
+     * Structured metadata is exempt: JSON.stringify escapes breaks already,
+     * and verbose mode deliberately pretty-prints it across lines.
+     */
+    _toSingleLine(message) {
+        const text = typeof message === 'string' ? message : String(message);
+        return text.replace(/[\r\n]+/g, ' | ').replace(/\n/g, '');
+    }
+
+    /**
      * Return a copy of a metadata value with sensitive fields redacted. Recurses
      * into plain objects and arrays; non-plain objects (e.g. Error instances) are
      * left untouched so they stringify exactly as before.
@@ -107,7 +141,10 @@ class Logger {
         if (proto !== Object.prototype && proto !== null) {
             return value;
         }
-        const redacted = {};
+        // Null prototype: metadata is sometimes a parsed JSON body, and a
+        // `__proto__` key in one would otherwise set the copy's prototype
+        // instead of a property. Own keys are all kept either way.
+        const redacted = Object.create(null);
         for (const [key, val] of Object.entries(value)) {
             redacted[key] = Logger.SENSITIVE_KEY_PATTERN.test(key)
                 ? '[REDACTED]'
@@ -121,7 +158,8 @@ class Logger {
             return;
         }
 
-        const formattedMessage = this._formatMessage(level, message, meta);
+        const [text, metadata] = this._coerceLogArgs(message, meta);
+        const formattedMessage = this._formatMessage(level, text, metadata);
         
         // Use appropriate console method based on level
         switch (level) {
@@ -217,6 +255,23 @@ class Logger {
     }
 }
 
+/**
+ * Resolve the logger level from runtime settings.
+ *
+ * Uses schema defaults via resolveSetting so an unset log_level becomes
+ * 'info'. The legacy `logging` boolean is only consulted when log_level
+ * resolves to a falsy value (historic `log_level || (logging ? 'info' : 'warn')`).
+ *
+ * @param {Object|null|undefined} settings
+ * @returns {string}
+ */
+function resolveLogLevelFromSettings(settings) {
+    const { resolveSetting } = require('./config/schema');
+    const level = resolveSetting(settings || {}, 'log_level');
+    if (level) return level;
+    return resolveSetting(settings || {}, 'logging') ? 'info' : 'warn';
+}
+
 // Metadata keys whose values must never be written to logs in clear text.
 Logger.SENSITIVE_KEY_PATTERN = /pass|secret|token|credential|api[-_]?key|auth/i;
 
@@ -227,6 +282,7 @@ const defaultLogger = new Logger();
 module.exports = {
     Logger,
     createLogger: (options) => new Logger(options),
+    resolveLogLevelFromSettings,
     logger: defaultLogger,
     // Convenience exports for default logger
     error: (msg, meta) => defaultLogger.error(msg, meta),

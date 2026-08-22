@@ -86,7 +86,7 @@ function evictOldestFifo(map) {
 /**
  * Encode a temperature (°C) as an 8-bit C-Bus level for the lighting-style HVAC
  * application, which uses 0.5°C resolution (level = temperature × 2), clamped to
- * the valid 0-255 range. This is the inverse of `level / 2`.
+ * the valid 0-255 range. Inverse of {@link cbusLevelToTemperature}.
  *
  * Note: the native C-Bus air-conditioning application uses a different 16-bit
  * (×256) encoding and is intentionally not handled here.
@@ -96,6 +96,18 @@ function evictOldestFifo(map) {
  */
 function temperatureToCbusLevel(tempCelsius) {
     return Math.max(0, Math.min(255, Math.round(tempCelsius * 2)));
+}
+
+/**
+ * Decode a lighting-style HVAC C-Bus level back to °C (temp = level / 2).
+ * Inverse of {@link temperatureToCbusLevel}; does not clamp — callers pass a
+ * level already known to be in 0-255.
+ *
+ * @param {number} rawLevel - C-Bus raw level (0-255)
+ * @returns {number} Temperature in °C
+ */
+function cbusLevelToTemperature(rawLevel) {
+    return rawLevel / 2;
 }
 
 // TLS record content types: change_cipher_spec, alert, handshake,
@@ -128,6 +140,9 @@ function looksLikeTlsRecord(data) {
 // of the user's alarm PIN. Anchored on the verb so only that argument is
 // touched; the address and C-Gate's trailing metadata are left readable.
 const EMULATE_KEYPAD_KEY = /(security\s+emulate_keypad\s+\S+\s+)(\S+)/gi;
+// `LOGIN <user> <password>` — C-Gate echoes failed auth on the command port.
+// Same shape as the keypad pattern: keep the verb and username, hide the secret.
+const LOGIN_PASSWORD = /(login\s+\S+\s+)(\S+)/gi;
 
 /**
  * Strip secrets from a raw C-Gate protocol line before it is logged.
@@ -141,7 +156,8 @@ const EMULATE_KEYPAD_KEY = /(security\s+emulate_keypad\s+\S+\s+)(\S+)/gi;
  *
  * Applied wherever a raw C-Gate line is logged, published or written to disk,
  * rather than at each caller, so a future sensitive command cannot bypass it by
- * appearing somewhere new.
+ * appearing somewhere new. Keypad PIN digits and LOGIN passwords are stripped;
+ * the rest of the line stays readable.
  *
  * @param {string} line - Raw C-Gate line, inbound or outbound.
  * @returns {string} The line with any keypad key replaced by `***`.
@@ -152,7 +168,9 @@ function redactCgateLine(line) {
     // regex below or an echo in a different case slips through unredacted,
     // which is exactly the leak this exists to close. Only reached when debug
     // logging is on, so one regex per line costs nothing that matters.
-    return line.replace(EMULATE_KEYPAD_KEY, '$1***');
+    return line
+        .replace(EMULATE_KEYPAD_KEY, '$1***')
+        .replace(LOGIN_PASSWORD, '$1***');
 }
 
 // The `code` field of a Home Assistant alarm command payload
@@ -189,6 +207,7 @@ module.exports = {
     isCbusAddressComponentInRange,
     describeCbusAddressRangeError,
     temperatureToCbusLevel,
+    cbusLevelToTemperature,
     looksLikeTlsRecord,
     redactCgateLine,
     redactMqttPayload

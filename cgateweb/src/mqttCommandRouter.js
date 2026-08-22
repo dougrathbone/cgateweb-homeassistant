@@ -4,11 +4,13 @@ const CBusCommand = require('./cbusCommand');
 const CoverRampTracker = require('./coverRampTracker');
 const { createLogger } = require('./logger');
 const { temperatureToCbusLevel, redactMqttPayload, describeCbusAddressRangeError } = require('./utils');
+const { resolveSetting } = require('./config/schema');
 const {
     MQTT_TOPIC_MANUAL_TRIGGER,
     MQTT_TOPIC_PREFIX_READ,
     MQTT_RETAINED_STATE_OPTIONS,
     MQTT_TOPIC_SUFFIX_LEVEL,
+    MQTT_TOPIC_SUFFIX_STATE,
     MQTT_TOPIC_SUFFIX_POSITION,
     MQTT_CMD_TYPE_GETALL,
     MQTT_CMD_TYPE_GETTREE,
@@ -92,9 +94,6 @@ const SECURITY_ARM_MODE_BY_PAYLOAD = {
     ARM_HOME: 'day',
     ARM_VACATION: 'vacation'
 };
-// Debounce window for native-aircon setpoint writes (spec §25.12.11: wait a
-// few seconds after the user finishes adjusting, then send a single message).
-const AIRCON_SETPOINT_DEBOUNCE_MS = 3000;
 
 class MqttCommandRouter extends EventEmitter {
     /**
@@ -128,7 +127,7 @@ class MqttCommandRouter extends EventEmitter {
 
         // Use shared tracker if provided, otherwise create a private one
         this._coverRampTracker = options.coverRampTracker
-            || new CoverRampTracker(this.settings.coverRampUpdateIntervalMs || 500);
+            || new CoverRampTracker(resolveSetting(this.settings, 'coverRampUpdateIntervalMs'));
 
         // Brute-force limit on disarm, keyed by network/application. Built
         // lazily on first disarm so the settings object can be mutated after
@@ -155,12 +154,18 @@ class MqttCommandRouter extends EventEmitter {
      * @private
      */
     _getDisarmLimiter() {
-        const maxRequests = this.settings.securityDisarmMaxAttempts ?? 10;
-        const windowMs = this.settings.securityDisarmAttemptWindowMs ?? 600000;
+        const maxRequests = resolveSetting(this.settings, 'securityDisarmMaxAttempts');
+        const windowMs = resolveSetting(this.settings, 'securityDisarmAttemptWindowMs');
+        const maxTrackedSources = resolveSetting(this.settings, 'securityDisarmMaxTrackedKeys');
         if (!this._disarmLimiter
             || this._disarmLimiter.maxRequests !== maxRequests
-            || this._disarmLimiter.windowMs !== windowMs) {
-            this._disarmLimiter = new RateLimiter({ windowMs, maxRequests, maxTrackedSources: 256 });
+            || this._disarmLimiter.windowMs !== windowMs
+            || this._disarmLimiter.maxTrackedSources !== maxTrackedSources) {
+            this._disarmLimiter = new RateLimiter({
+                windowMs,
+                maxRequests,
+                maxTrackedSources
+            });
         }
         return this._disarmLimiter;
     }
@@ -665,11 +670,15 @@ class MqttCommandRouter extends EventEmitter {
         } else if (action === MQTT_STATE_OFF) {
             cgateCommand = `${CGATE_CMD_OFF} ${cbusPath}${NEWLINE}`;
         } else {
-            this.logger.warn(`Invalid payload for switch command: ${payload}`);
+            this.logger.warn(`Invalid payload for switch command: ${redactMqttPayload(payload)}`);
             return;
         }
 
         this._queueCommand(cgateCommand);
+        this._publishOptimisticLightState(command.getNetwork(), command.getApplication(), command.getGroup(), {
+            state: action,
+            levelPercent: action === MQTT_STATE_ON ? 100 : 0
+        });
     }
 
     /**
@@ -698,9 +707,17 @@ class MqttCommandRouter extends EventEmitter {
                 break;
             case MQTT_STATE_ON:
                 this._queueCommand(`${CGATE_CMD_ON} ${cbusPath}${NEWLINE}`);
+                this._publishOptimisticLightState(command.getNetwork(), command.getApplication(), command.getGroup(), {
+                    state: MQTT_STATE_ON,
+                    levelPercent: 100
+                });
                 break;
             case MQTT_STATE_OFF:
                 this._queueCommand(`${CGATE_CMD_OFF} ${cbusPath}${NEWLINE}`);
+                this._publishOptimisticLightState(command.getNetwork(), command.getApplication(), command.getGroup(), {
+                    state: MQTT_STATE_OFF,
+                    levelPercent: 0
+                });
                 break;
             default:
                 this._handleAbsoluteLevel(command, cbusPath, payload);
@@ -718,14 +735,19 @@ class MqttCommandRouter extends EventEmitter {
         const level = command.getLevel();
         const rampTime = command.getRampTime();
         
-        if (level !== null) {
+        if (typeof level === 'number') {
             let cgateCommand = `${CGATE_CMD_RAMP} ${cbusPath} ${level}`;
             if (rampTime) {
                 cgateCommand += ` ${rampTime}`;
             }
             this._queueCommand(cgateCommand + NEWLINE);
+            const levelPercent = Math.round(level / CGATE_LEVEL_MAX * 100);
+            this._publishOptimisticLightState(command.getNetwork(), command.getApplication(), command.getGroup(), {
+                state: level > 0 ? MQTT_STATE_ON : MQTT_STATE_OFF,
+                levelPercent
+            });
         } else {
-            this.logger.warn(`Invalid payload for ramp command: ${payload}`);
+            this.logger.warn(`Invalid payload for ramp command: ${redactMqttPayload(payload)}`);
         }
     }
 
@@ -749,11 +771,16 @@ class MqttCommandRouter extends EventEmitter {
         // DeviceStateManager (single owner of relative-level operations).
         this.deviceStateManager.cancelRelativeLevelOperation(levelAddress);
 
-        const timeoutMs = this.settings.relativeLevelTimeoutMs || 5000;
+        const timeoutMs = resolveSetting(this.settings, 'relativeLevelTimeoutMs');
         this.deviceStateManager.setupRelativeLevelOperation(levelAddress, (currentLevel) => {
             const newLevel = Math.max(CGATE_LEVEL_MIN, Math.min(limit, currentLevel + step));
             this.logger.debug(`${actionName}: ${levelAddress} ${currentLevel} -> ${newLevel}`);
             this._queueCommand(`${CGATE_CMD_RAMP} ${cbusPath} ${newLevel}${NEWLINE}`);
+            const [network, application, group] = levelAddress.split('/');
+            this._publishOptimisticLightState(network, application, group, {
+                state: newLevel > 0 ? MQTT_STATE_ON : MQTT_STATE_OFF,
+                levelPercent: Math.round(newLevel / CGATE_LEVEL_MAX * 100)
+            });
         }, timeoutMs);
 
         // Query current level first; the response drives the callback above.
@@ -904,7 +931,7 @@ class MqttCommandRouter extends EventEmitter {
         const startLevel = (this.deviceStateManager && this.deviceStateManager.getLevel(network, application, group)) || 0;
         const duration = durationMs !== null && durationMs !== undefined
             ? durationMs
-            : (this.settings.cover_ramp_duration_ms || 5000);
+            : resolveSetting(this.settings, 'cover_ramp_duration_ms');
 
         const mqttOptions = this.settings.retainreads ? MQTT_RETAINED_STATE_OPTIONS : { qos: 0 };
         const topicBase = `${MQTT_TOPIC_PREFIX_READ}/${network}/${application}/${group}`;
@@ -1130,13 +1157,14 @@ class MqttCommandRouter extends EventEmitter {
         const key = `${network}/${unit}`;
         const pending = this._airconSetpointTimers.get(key);
         if (pending) clearTimeout(pending.handle);
+        const delayMs = resolveSetting(this.settings, 'airconSetpointDebounceMs');
         const handle = setTimeout(() => {
             this._airconSetpointTimers.delete(key);
             this._sendAirconSetpoint(network, application, unit, clamped);
-        }, AIRCON_SETPOINT_DEBOUNCE_MS);
+        }, delayMs);
         if (typeof handle.unref === 'function') handle.unref();
         this._airconSetpointTimers.set(key, { handle });
-        this.logger.debug(`Native HVAC setpoint: ${network}/${unit} -> ${clamped}°C queued (debounced ${AIRCON_SETPOINT_DEBOUNCE_MS}ms)`);
+        this.logger.debug(`Native HVAC setpoint: ${network}/${unit} -> ${clamped}°C queued (debounced ${delayMs}ms)`);
     }
 
     /**
@@ -1179,6 +1207,32 @@ class MqttCommandRouter extends EventEmitter {
         // Keep the learned state coherent until the thermostat's echo broadcast.
         this.airconControlRegistry.noteSetpointWrite(network, unit, modeRaw, level);
         this.logger.info(`Native HVAC setpoint: ${network}/${unit} -> ${clamped}°C (ward ${state.ward}, zones ${state.zones})`);
+    }
+
+    /**
+     * Publish expected lighting state/level immediately after a write so Home
+     * Assistant's light card updates without waiting for the C-Gate event port
+     * (issue #52: dim from HA succeeded on the bus while the entity stayed off).
+     * The real event confirms the same topics shortly after.
+     * @param {string} network
+     * @param {string} application
+     * @param {string} group
+     * @param {{ state?: string, levelPercent?: number }} [fields]
+     * @private
+     */
+    _publishOptimisticLightState(network, application, group, fields = {}) {
+        if (!this.mqttClient || typeof this.mqttClient.publish !== 'function') return;
+        if (!network || !application || !group) return;
+        const state = fields.state;
+        const levelPercent = fields.levelPercent;
+        const base = `${MQTT_TOPIC_PREFIX_READ}/${network}/${application}/${group}`;
+        const opts = this.settings.retainreads ? MQTT_RETAINED_STATE_OPTIONS : { qos: 0 };
+        if (state !== undefined && state !== null) {
+            this.mqttClient.publish(`${base}/${MQTT_TOPIC_SUFFIX_STATE}`, String(state), opts);
+        }
+        if (levelPercent !== undefined && levelPercent !== null) {
+            this.mqttClient.publish(`${base}/${MQTT_TOPIC_SUFFIX_LEVEL}`, String(levelPercent), opts);
+        }
     }
 
     /**

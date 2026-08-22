@@ -1,6 +1,7 @@
 // @ts-check
-const { createLogger } = require('./logger');
-const { clampSetting, evictOldestFifo } = require('./utils');
+const { createLogger, resolveLogLevelFromSettings } = require('./logger');
+const { evictOldestFifo, cbusLevelToTemperature } = require('./utils');
+const { resolveClampedSetting } = require('./config/schema');
 const {
     MQTT_TOPIC_PREFIX_READ,
     MQTT_TOPIC_SUFFIX_STATE,
@@ -78,6 +79,376 @@ const SECURITY_ZONE_ISOLATED_ATTRIBUTES_PAYLOAD = Object.freeze({
 const SECURITY_ZONE_ISOLATED_ONLY_PAYLOAD = '{"isolated":true}';
 const SECURITY_ZONE_NO_ATTRIBUTES_PAYLOAD = '{}';
 
+/**
+ * Dispatch table for publishReading: kind → handler(ep, base, reading).
+ * Handlers keep the historical publish semantics (skip nulls, pre-rendered
+ * security payloads, etc.); the table only removes the if/else chain.
+ */
+const READING_KIND_HANDLERS = {
+    temperature(ep, base, reading) {
+        // celsius is null when the sensor reports total failure (§25.8.6) —
+        // surface the status, not the meaningless temperature.
+        if (reading.celsius !== null && reading.celsius !== undefined) {
+            ep._publishIfNeeded(
+                `${base}/${MQTT_TOPIC_SUFFIX_HVAC_CURRENT_TEMP}`,
+                String(reading.celsius),
+                ep.mqttOptions
+            );
+        }
+        if (reading.sensorStatus !== null && reading.sensorStatus !== undefined) {
+            ep._publishIfNeeded(
+                `${base}/${MQTT_TOPIC_SUFFIX_HVAC_SENSOR_STATUS}`,
+                String(reading.sensorStatus),
+                ep.mqttOptions
+            );
+            // Degraded (out of calibration) or failed sensor → problem state
+            // for the binary_sensor (spec §25.6.12).
+            ep._publishIfNeeded(
+                `${base}/${MQTT_TOPIC_SUFFIX_HVAC_SENSOR_PROBLEM}`,
+                reading.sensorStatus >= 2 ? MQTT_STATE_ON : MQTT_STATE_OFF,
+                ep.mqttOptions
+            );
+        }
+    },
+
+    mode(ep, base, reading) {
+        if (reading.mode !== null && reading.mode !== undefined) {
+            ep._publishIfNeeded(
+                `${base}/${MQTT_TOPIC_SUFFIX_HVAC_MODE}`,
+                reading.mode,
+                ep.mqttOptions
+            );
+        }
+        if (reading.setpoint !== null && reading.setpoint !== undefined) {
+            ep._publishIfNeeded(
+                `${base}/${MQTT_TOPIC_SUFFIX_HVAC_SETPOINT}`,
+                String(reading.setpoint),
+                ep.mqttOptions
+            );
+        }
+        // Fan speed/mode from the Aux Level (spec §25.6.11). Fan speed is the
+        // raw 0-63 setting (0 = default speed) — HA climate has no numeric
+        // fan-speed concept, so it stays an MQTT-only topic.
+        if (reading.fanMode !== null && reading.fanMode !== undefined) {
+            ep._publishIfNeeded(
+                `${base}/${MQTT_TOPIC_SUFFIX_HVAC_FAN_MODE}`,
+                reading.fanMode,
+                ep.mqttOptions
+            );
+        }
+        if (reading.fanSpeed !== null && reading.fanSpeed !== undefined) {
+            ep._publishIfNeeded(
+                `${base}/${MQTT_TOPIC_SUFFIX_HVAC_FAN_SPEED}`,
+                String(reading.fanSpeed),
+                ep.mqttOptions
+            );
+        }
+        // Fan speed from the Raw Level (vent/fan, evaporative-manual) as a
+        // percentage (§25.12.8), and the evaporative Comfort Level
+        // (§25.12.7) — both MQTT-only (no HA climate equivalent).
+        if (reading.fanSpeedPercent !== null && reading.fanSpeedPercent !== undefined) {
+            ep._publishIfNeeded(
+                `${base}/${MQTT_TOPIC_SUFFIX_HVAC_FAN_SPEED_PCT}`,
+                String(reading.fanSpeedPercent),
+                ep.mqttOptions
+            );
+        }
+        if (reading.comfortLevel !== null && reading.comfortLevel !== undefined) {
+            ep._publishIfNeeded(
+                `${base}/${MQTT_TOPIC_SUFFIX_HVAC_COMFORT_LEVEL}`,
+                String(reading.comfortLevel),
+                ep.mqttOptions
+            );
+        }
+    },
+
+    clock(ep, base, reading) {
+        // Clock and Timekeeping (app 223): the network's date and time
+        // arrive as two separate broadcasts, so each gets its own topic
+        // and neither waits on the other. Published verbatim as the
+        // network reported them — see the note in clockDecoder.js on why
+        // they are deliberately not combined into a timestamp.
+        ep._publishIfNeeded(
+            `${base}/${reading.variant}`,
+            reading.value,
+            ep.mqttOptions
+        );
+    },
+
+    state(ep, base, reading) {
+        ep._publishIfNeeded(
+            `${base}/${MQTT_TOPIC_SUFFIX_STATE}`,
+            reading.on ? 'ON' : 'OFF',
+            ep.mqttOptions
+        );
+    },
+
+    action(ep, base, reading) {
+        // Live plant running state → Home Assistant climate hvac_action.
+        ep._publishIfNeeded(
+            `${base}/${MQTT_TOPIC_SUFFIX_HVAC_ACTION}`,
+            reading.action,
+            ep.mqttOptions
+        );
+        // The remaining §25.6.6 status bits. cooling/heating/fan are already
+        // folded into `action` above; these three carry information that
+        // hvac_action cannot express, so they get their own topics rather
+        // than being decoded and thrown away:
+        //   damper (bit 3) — Closed/Open, ON = open
+        //   busy   (bit 5) — the plant is mid-transition, so a mode or
+        //                    setpoint write may not take effect yet
+        //   expansion (bit 7) — protocol expansion marker with no defined
+        //                    meaning in issue 1.12; published for
+        //                    completeness, deliberately given no HA entity
+        //                    (nothing sensible to show a user).
+        ep._publishBooleanIfPresent(reading.damper, `${base}/${MQTT_TOPIC_SUFFIX_HVAC_DAMPER}`);
+        ep._publishBooleanIfPresent(reading.busy, `${base}/${MQTT_TOPIC_SUFFIX_HVAC_BUSY}`);
+        ep._publishBooleanIfPresent(reading.expansion, `${base}/${MQTT_TOPIC_SUFFIX_HVAC_EXPANSION}`);
+        // Plant type (spec §25.6.4): numeric code + human description, the
+        // same pairing as the error code below. This is the plant actually
+        // reporting status, not the type requested by a mode broadcast —
+        // see decodeZonePlantStatus for why only this verb feeds the topic.
+        if (reading.type !== null && reading.type !== undefined) {
+            ep._publishIfNeeded(
+                `${base}/${MQTT_TOPIC_SUFFIX_HVAC_PLANT_TYPE}`,
+                String(reading.type),
+                ep.mqttOptions
+            );
+            ep._publishIfNeeded(
+                `${base}/${MQTT_TOPIC_SUFFIX_HVAC_PLANT_TYPE_DESCRIPTION}`,
+                reading.typeDescription,
+                ep.mqttOptions
+            );
+        }
+        // Plant error state (spec §25.6.5): numeric code + human description.
+        if (reading.errorCode !== null && reading.errorCode !== undefined) {
+            ep._publishIfNeeded(
+                `${base}/${MQTT_TOPIC_SUFFIX_HVAC_ERROR}`,
+                String(reading.errorCode),
+                ep.mqttOptions
+            );
+            ep._publishIfNeeded(
+                `${base}/${MQTT_TOPIC_SUFFIX_HVAC_ERROR_DESCRIPTION}`,
+                reading.errorDescription,
+                ep.mqttOptions
+            );
+        }
+        // Problem binary state for the HA binary_sensor: ON when the status
+        // error bit (§25.6.6 bit 6) or a non-zero error code says so.
+        if ((reading.error !== null && reading.error !== undefined)
+            || (reading.errorCode !== null && reading.errorCode !== undefined)) {
+            const problem = reading.error === true || (reading.errorCode || 0) > 0;
+            ep._publishIfNeeded(
+                `${base}/${MQTT_TOPIC_SUFFIX_HVAC_PROBLEM}`,
+                problem ? MQTT_STATE_ON : MQTT_STATE_OFF,
+                ep.mqttOptions
+            );
+        }
+    },
+
+    humidity(ep, base, reading) {
+        // Zone humidity (spec §25.8.7, 0–100%). Null when the sensor reports
+        // total failure — surface nothing rather than a bogus reading.
+        if (reading.humidity !== null && reading.humidity !== undefined) {
+            ep._publishIfNeeded(
+                `${base}/${MQTT_TOPIC_SUFFIX_HVAC_CURRENT_HUMIDITY}`,
+                String(reading.humidity),
+                ep.mqttOptions
+            );
+        }
+    },
+
+    humidity_mode(ep, base, reading) {
+        // Humidity control mode + target (spec §25.8.12). MQTT-only state;
+        // the climate entity reads these as current/target humidity.
+        if (reading.mode !== null && reading.mode !== undefined) {
+            ep._publishIfNeeded(
+                `${base}/${MQTT_TOPIC_SUFFIX_HVAC_HUMIDITY_MODE}`,
+                reading.mode,
+                ep.mqttOptions
+            );
+        }
+        if (reading.humiditySetpoint !== null && reading.humiditySetpoint !== undefined) {
+            ep._publishIfNeeded(
+                `${base}/${MQTT_TOPIC_SUFFIX_HVAC_HUMIDITY_SETPOINT}`,
+                String(reading.humiditySetpoint),
+                ep.mqttOptions
+            );
+        }
+    },
+
+    humidity_action(ep, base, reading) {
+        // Humidity plant running state (spec §25.8.5/§25.6.10).
+        ep._publishIfNeeded(
+            `${base}/${MQTT_TOPIC_SUFFIX_HVAC_HUMIDITY_ACTION}`,
+            reading.action,
+            ep.mqttOptions
+        );
+    },
+
+    security_zone(ep, base, reading) {
+        // Security zone state (app 208): the binary_sensor state is ON for
+        // unsealed/open/short and OFF for sealed; the raw 2-bit state name
+        // goes to the JSON attributes topic so automations can distinguish
+        // fault states (open/short) from a normal unsealed zone.
+        //
+        // `isolated` is extra context on the attributes topic only — an
+        // isolated zone that is unsealed is still unsealed, so the state
+        // topic's meaning is untouched. A reading with no zoneState is an
+        // isolation-only update (the panel bypassed a zone without
+        // reporting its state), which publishes attributes and nothing else.
+        const hasZoneState = reading.zoneState !== null && reading.zoneState !== undefined;
+        const isolated = reading.isolated === true;
+        if (hasZoneState) {
+            ep._publishIfNeeded(
+                `${base}/${MQTT_TOPIC_SUFFIX_STATE}`,
+                reading.zoneState === 'sealed' ? MQTT_STATE_OFF : MQTT_STATE_ON,
+                ep.mqttOptions
+            );
+        }
+        const attributesPayload = hasZoneState
+            ? (isolated ? SECURITY_ZONE_ISOLATED_ATTRIBUTES_PAYLOAD : SECURITY_ZONE_ATTRIBUTES_PAYLOAD)[reading.zoneState]
+            : (isolated ? SECURITY_ZONE_ISOLATED_ONLY_PAYLOAD : SECURITY_ZONE_NO_ATTRIBUTES_PAYLOAD);
+        if (attributesPayload) {
+            ep._publishIfNeeded(
+                `${base}/${MQTT_TOPIC_SUFFIX_ATTRIBUTES}`,
+                attributesPayload,
+                ep.mqttOptions
+            );
+        }
+    },
+
+    security_panel(ep, base, reading) {
+        // Panel-wide trouble condition (app 208): ON means the trouble is
+        // present. `group` is the "panel/<condition>" path segment, so the
+        // base already addresses the right topic.
+        ep._publishIfNeeded(
+            `${base}/${MQTT_TOPIC_SUFFIX_STATE}`,
+            reading.active ? MQTT_STATE_ON : MQTT_STATE_OFF,
+            ep.mqttOptions
+        );
+    },
+
+    security_alarm(ep, base, reading) {
+        // HA alarm_control_panel state (app 208): one of disarmed,
+        // armed_home/away/night/vacation, arming, pending, triggered.
+        // `group` is "panel", so the base is cbus/read/{net}/{app}/panel.
+        // The blocking zone (arm_not_ready) rides the attributes topic and
+        // is republished on every transition so it clears with the state.
+        ep._publishIfNeeded(
+            `${base}/${MQTT_TOPIC_SUFFIX_STATE}`,
+            reading.alarmState,
+            ep.mqttOptions
+        );
+        const attributes = reading.blockingZone ? { blocking_zone: reading.blockingZone } : {};
+        ep._publishIfNeeded(
+            `${base}/${MQTT_TOPIC_SUFFIX_ATTRIBUTES}`,
+            JSON.stringify(attributes),
+            ep.mqttOptions
+        );
+    },
+
+    measurement(ep, base, reading) {
+        // Measurement application (app 228): `group` is "{device}/{channel}",
+        // so `base` already addresses cbus/read/{net}/{app}/{device}/{channel}.
+        ep._publishIfNeeded(
+            `${base}/${MQTT_TOPIC_SUFFIX_VALUE}`,
+            String(reading.value),
+            ep.mqttOptions
+        );
+        ep._publishIfNeeded(
+            `${base}/${MQTT_TOPIC_SUFFIX_UNIT}`,
+            reading.unit || '',
+            ep.mqttOptions
+        );
+    }
+};
+
+/**
+ * Dispatch table for publishEvent after shared classification/setup:
+ * kind → handler(ep, ctx). Handlers keep the historical publish semantics;
+ * the table only removes the if/else chain among trigger / hvac / tilt / status.
+ */
+const EVENT_KIND_HANDLERS = {
+    trigger(ep, ctx) {
+        const eventPayload = ctx.rawLevel !== null
+            ? JSON.stringify({ event_type: 'trigger', level: ctx.rawLevel })
+            : JSON.stringify({ event_type: 'trigger' });
+
+        if (ep.logger.isLevelEnabled && ep.logger.isLevelEnabled('debug')) {
+            ep.logger.debug(
+                `C-Bus Trigger ${ctx.source}: ${ctx.network}/${ctx.application}/${ctx.group}`
+                + (ctx.rawLevel !== null ? ` level=${ctx.rawLevel}` : '')
+            );
+        }
+
+        ep._publishIfNeeded(
+            ctx.topics.event,
+            eventPayload,
+            ep._triggerMqttOptions
+        );
+    },
+
+    hvac(ep, ctx) {
+        ep._publishHvacEvent(
+            ctx.network,
+            ctx.application,
+            ctx.group,
+            ctx.rawLevel,
+            ctx.action,
+            ctx.source
+        );
+    },
+
+    tilt(ep, ctx) {
+        // Same 0-100 rounding as levelPercent (HA integer percent).
+        if (ep.logger.isLevelEnabled && ep.logger.isLevelEnabled('debug')) {
+            ep.logger.debug(
+                `C-Bus Tilt ${ctx.source}: ${ctx.network}/${ctx.application}/${ctx.group} ${ctx.levelPercent}%`
+            );
+        }
+
+        ep._publishIfNeeded(
+            `${MQTT_TOPIC_PREFIX_READ}/${ctx.network}/${ctx.application}/${ctx.group}/${MQTT_TOPIC_SUFFIX_TILT}`,
+            ctx.levelPercent.toString(),
+            ep.mqttOptions
+        );
+    },
+
+    // Lighting, cover, and PIR: state always; level/position unless PIR.
+    status(ep, ctx) {
+        if (ep.logger.isLevelEnabled && ep.logger.isLevelEnabled('debug')) {
+            ep.logger.debug(
+                `C-Bus Status ${ctx.source}: ${ctx.network}/${ctx.application}/${ctx.group} ${ctx.state}`
+                + (ctx.isPirSensor ? '' : ` (${ctx.levelPercent}%)`)
+            );
+        }
+
+        ep._publishIfNeeded(
+            ctx.topics.state,
+            ctx.state,
+            ep.mqttOptions
+        );
+
+        if (!ctx.isPirSensor) {
+            ep._publishIfNeeded(
+                ctx.topics.level,
+                ctx.levelPercent.toString(),
+                ep.mqttOptions
+            );
+
+            // Position mirrors level on a separate topic for the HA cover entity.
+            if (ctx.isCover) {
+                ep._publishIfNeeded(
+                    ctx.topics.position,
+                    ctx.levelPercent.toString(),
+                    ep.mqttOptions
+                );
+            }
+        }
+    }
+};
+
 class EventPublisher {
     /**
      * Creates a new EventPublisher instance.
@@ -101,9 +472,9 @@ class EventPublisher {
         this.labelLoader = options.labelLoader || null;
         this.coverRampTracker = options.coverRampTracker || null;
         this.onEventLog = options.onEventLog || null;
-        this.eventPublishDedupWindowMs = clampSetting(this.settings.eventPublishDedupWindowMs, 0, 0);
-        this.eventPublishDedupMaxEntries = clampSetting(this.settings.eventPublishDedupMaxEntries, 100, 5000);
-        this.topicCacheMaxEntries = clampSetting(this.settings.topicCacheMaxEntries, 100, 5000);
+        this.eventPublishDedupWindowMs = resolveClampedSetting(this.settings, 'eventPublishDedupWindowMs', { min: 0 });
+        this.eventPublishDedupMaxEntries = resolveClampedSetting(this.settings, 'eventPublishDedupMaxEntries', { min: 100 });
+        this.topicCacheMaxEntries = resolveClampedSetting(this.settings, 'topicCacheMaxEntries', { min: 100 });
         this.eventPublishCoalesce = this.settings.eventPublishCoalesce === true;
         this._recentPublishes = new Map();
         this._topicCache = new Map();
@@ -121,7 +492,7 @@ class EventPublisher {
         
         this.logger = options.logger || createLogger({ 
             component: 'event-publisher', 
-            level: this.settings.log_level || (this.settings.logging ? 'info' : 'warn'),
+            level: resolveLogLevelFromSettings(this.settings),
             enabled: true 
         });
     }
@@ -197,11 +568,11 @@ class EventPublisher {
 
         let state;
         if (isPirSensor) {
-            // PIR sensors: state based on action (motion detected/cleared)
+            // PIR: ON/OFF from action (motion detected/cleared), not level.
             state = actionIsOn ? MQTT_STATE_ON : MQTT_STATE_OFF;
         } else {
-            // Covers and lighting: state based on raw level, not quantized
-            // percent — rawLevel 1-2 rounds to 0% but the device IS on/open.
+            // Covers and lighting: state from raw level, not quantized percent —
+            // rawLevel 1-2 rounds to 0% but the device IS on/open.
             state = rawLevel !== null
                 ? ((rawLevel > 0) ? MQTT_STATE_ON : MQTT_STATE_OFF)
                 : (actionIsOn ? MQTT_STATE_ON : MQTT_STATE_OFF);
@@ -209,11 +580,11 @@ class EventPublisher {
        
         // Emit event log entry for live event stream (before any early returns)
         if (this.onEventLog) {
-            const action = event.getAction();
+            const logAction = event.getAction();
             let eventType = 'update';
-            if (action === 'ramp') eventType = 'ramp';
-            else if (action === 'on') eventType = 'on';
-            else if (action === 'off') eventType = 'off';
+            if (logAction === 'ramp') eventType = 'ramp';
+            else if (logAction === 'on') eventType = 'on';
+            else if (logAction === 'off') eventType = 'off';
             this.onEventLog({
                 ts: Date.now(),
                 network: network,
@@ -224,77 +595,24 @@ class EventPublisher {
             });
         }
 
-        // Trigger groups publish as HA event entities - never retain
-        if (isTrigger) {
-            const eventPayload = rawLevel !== null
-                ? JSON.stringify({ event_type: 'trigger', level: rawLevel })
-                : JSON.stringify({ event_type: 'trigger' });
-
-            if (this.logger.isLevelEnabled && this.logger.isLevelEnabled('debug')) {
-                this.logger.debug(`C-Bus Trigger ${source}: ${network}/${application}/${group}` + (rawLevel !== null ? ` level=${rawLevel}` : ''));
-            }
-
-            // Trigger events must not be retained - always publish with retain: false
-            this._publishIfNeeded(
-                topics.event,
-                eventPayload,
-                this._triggerMqttOptions
-            );
-            return;
-        }
-
-        // HVAC groups publish temperature/mode to dedicated climate topics
-        if (isHvac) {
-            this._publishHvacEvent(network, application, group, rawLevel, action, source);
-            return;
-        }
-
-        // Tilt app groups publish tilt angle to the tilt topic only (0-100%)
-        if (isTiltApp) {
-            const tiltPercent = rawLevel !== null
-                ? Math.round(rawLevel / CGATE_LEVEL_MAX * 100)
-                : (actionIsOn ? 100 : 0);
-
-            if (this.logger.isLevelEnabled && this.logger.isLevelEnabled('debug')) {
-                this.logger.debug(`C-Bus Tilt ${source}: ${network}/${application}/${group} ${tiltPercent}%`);
-            }
-
-            this._publishIfNeeded(
-                `${MQTT_TOPIC_PREFIX_READ}/${network}/${application}/${group}/${MQTT_TOPIC_SUFFIX_TILT}`,
-                tiltPercent.toString(),
-                this.mqttOptions
-            );
-            return;
-        }
-
-        if (this.logger.isLevelEnabled && this.logger.isLevelEnabled('debug')) {
-            this.logger.debug(`C-Bus Status ${source}: ${network}/${application}/${group} ${state}` + (isPirSensor ? '' : ` (${levelPercent}%)`));
-        }
-
-        // Publish state message directly (no throttle)
-        this._publishIfNeeded(
-            topics.state,
+        const kind = isTrigger ? 'trigger'
+            : isHvac ? 'hvac'
+                : isTiltApp ? 'tilt'
+                    : 'status';
+        EVENT_KIND_HANDLERS[kind](this, {
+            network,
+            application,
+            group,
+            action,
+            rawLevel,
+            actionIsOn,
+            source,
+            topics,
+            isPirSensor,
+            isCover,
             state,
-            this.mqttOptions
-        );
-
-        // Publish level/position message for non-PIR sensors
-        if (!isPirSensor) {
-            this._publishIfNeeded(
-                topics.level,
-                levelPercent.toString(),
-                this.mqttOptions
-            );
-
-            // Also publish position for covers (same value, different topic for HA cover entity)
-            if (isCover) {
-                this._publishIfNeeded(
-                    topics.position,
-                    levelPercent.toString(),
-                    this.mqttOptions
-                );
-            }
-        }
+            levelPercent
+        });
     }
 
     /**
@@ -327,261 +645,9 @@ class EventPublisher {
         if (!reading) return;
 
         const base = `${MQTT_TOPIC_PREFIX_READ}/${network}/${application}/${group}`;
-
-        if (reading.kind === 'temperature') {
-            // celsius is null when the sensor reports total failure (§25.8.6) —
-            // surface the status, not the meaningless temperature.
-            if (reading.celsius !== null && reading.celsius !== undefined) {
-                this._publishIfNeeded(
-                    `${base}/${MQTT_TOPIC_SUFFIX_HVAC_CURRENT_TEMP}`,
-                    String(reading.celsius),
-                    this.mqttOptions
-                );
-            }
-            if (reading.sensorStatus !== null && reading.sensorStatus !== undefined) {
-                this._publishIfNeeded(
-                    `${base}/${MQTT_TOPIC_SUFFIX_HVAC_SENSOR_STATUS}`,
-                    String(reading.sensorStatus),
-                    this.mqttOptions
-                );
-                // Degraded (out of calibration) or failed sensor → problem state
-                // for the binary_sensor (spec §25.6.12).
-                this._publishIfNeeded(
-                    `${base}/${MQTT_TOPIC_SUFFIX_HVAC_SENSOR_PROBLEM}`,
-                    reading.sensorStatus >= 2 ? MQTT_STATE_ON : MQTT_STATE_OFF,
-                    this.mqttOptions
-                );
-            }
-        } else if (reading.kind === 'mode') {
-            if (reading.mode !== null && reading.mode !== undefined) {
-                this._publishIfNeeded(
-                    `${base}/${MQTT_TOPIC_SUFFIX_HVAC_MODE}`,
-                    reading.mode,
-                    this.mqttOptions
-                );
-            }
-            if (reading.setpoint !== null && reading.setpoint !== undefined) {
-                this._publishIfNeeded(
-                    `${base}/${MQTT_TOPIC_SUFFIX_HVAC_SETPOINT}`,
-                    String(reading.setpoint),
-                    this.mqttOptions
-                );
-            }
-            // Fan speed/mode from the Aux Level (spec §25.6.11). Fan speed is the
-            // raw 0-63 setting (0 = default speed) — HA climate has no numeric
-            // fan-speed concept, so it stays an MQTT-only topic.
-            if (reading.fanMode !== null && reading.fanMode !== undefined) {
-                this._publishIfNeeded(
-                    `${base}/${MQTT_TOPIC_SUFFIX_HVAC_FAN_MODE}`,
-                    reading.fanMode,
-                    this.mqttOptions
-                );
-            }
-            if (reading.fanSpeed !== null && reading.fanSpeed !== undefined) {
-                this._publishIfNeeded(
-                    `${base}/${MQTT_TOPIC_SUFFIX_HVAC_FAN_SPEED}`,
-                    String(reading.fanSpeed),
-                    this.mqttOptions
-                );
-            }
-            // Fan speed from the Raw Level (vent/fan, evaporative-manual) as a
-            // percentage (§25.12.8), and the evaporative Comfort Level
-            // (§25.12.7) — both MQTT-only (no HA climate equivalent).
-            if (reading.fanSpeedPercent !== null && reading.fanSpeedPercent !== undefined) {
-                this._publishIfNeeded(
-                    `${base}/${MQTT_TOPIC_SUFFIX_HVAC_FAN_SPEED_PCT}`,
-                    String(reading.fanSpeedPercent),
-                    this.mqttOptions
-                );
-            }
-            if (reading.comfortLevel !== null && reading.comfortLevel !== undefined) {
-                this._publishIfNeeded(
-                    `${base}/${MQTT_TOPIC_SUFFIX_HVAC_COMFORT_LEVEL}`,
-                    String(reading.comfortLevel),
-                    this.mqttOptions
-                );
-            }
-        } else if (reading.kind === 'clock') {
-            // Clock and Timekeeping (app 223): the network's date and time
-            // arrive as two separate broadcasts, so each gets its own topic
-            // and neither waits on the other. Published verbatim as the
-            // network reported them — see the note in clockDecoder.js on why
-            // they are deliberately not combined into a timestamp.
-            this._publishIfNeeded(
-                `${base}/${reading.variant}`,
-                reading.value,
-                this.mqttOptions
-            );
-        } else if (reading.kind === 'state') {
-            this._publishIfNeeded(
-                `${base}/${MQTT_TOPIC_SUFFIX_STATE}`,
-                reading.on ? 'ON' : 'OFF',
-                this.mqttOptions
-            );
-        } else if (reading.kind === 'action') {
-            // Live plant running state → Home Assistant climate hvac_action.
-            this._publishIfNeeded(
-                `${base}/${MQTT_TOPIC_SUFFIX_HVAC_ACTION}`,
-                reading.action,
-                this.mqttOptions
-            );
-            // The remaining §25.6.6 status bits. cooling/heating/fan are already
-            // folded into `action` above; these three carry information that
-            // hvac_action cannot express, so they get their own topics rather
-            // than being decoded and thrown away:
-            //   damper (bit 3) — Closed/Open, ON = open
-            //   busy   (bit 5) — the plant is mid-transition, so a mode or
-            //                    setpoint write may not take effect yet
-            //   expansion (bit 7) — protocol expansion marker with no defined
-            //                    meaning in issue 1.12; published for
-            //                    completeness, deliberately given no HA entity
-            //                    (nothing sensible to show a user).
-            this._publishBooleanIfPresent(reading.damper, `${base}/${MQTT_TOPIC_SUFFIX_HVAC_DAMPER}`);
-            this._publishBooleanIfPresent(reading.busy, `${base}/${MQTT_TOPIC_SUFFIX_HVAC_BUSY}`);
-            this._publishBooleanIfPresent(reading.expansion, `${base}/${MQTT_TOPIC_SUFFIX_HVAC_EXPANSION}`);
-            // Plant type (spec §25.6.4): numeric code + human description, the
-            // same pairing as the error code below. This is the plant actually
-            // reporting status, not the type requested by a mode broadcast —
-            // see decodeZonePlantStatus for why only this verb feeds the topic.
-            if (reading.type !== null && reading.type !== undefined) {
-                this._publishIfNeeded(
-                    `${base}/${MQTT_TOPIC_SUFFIX_HVAC_PLANT_TYPE}`,
-                    String(reading.type),
-                    this.mqttOptions
-                );
-                this._publishIfNeeded(
-                    `${base}/${MQTT_TOPIC_SUFFIX_HVAC_PLANT_TYPE_DESCRIPTION}`,
-                    reading.typeDescription,
-                    this.mqttOptions
-                );
-            }
-            // Plant error state (spec §25.6.5): numeric code + human description.
-            if (reading.errorCode !== null && reading.errorCode !== undefined) {
-                this._publishIfNeeded(
-                    `${base}/${MQTT_TOPIC_SUFFIX_HVAC_ERROR}`,
-                    String(reading.errorCode),
-                    this.mqttOptions
-                );
-                this._publishIfNeeded(
-                    `${base}/${MQTT_TOPIC_SUFFIX_HVAC_ERROR_DESCRIPTION}`,
-                    reading.errorDescription,
-                    this.mqttOptions
-                );
-            }
-            // Problem binary state for the HA binary_sensor: ON when the status
-            // error bit (§25.6.6 bit 6) or a non-zero error code says so.
-            if ((reading.error !== null && reading.error !== undefined)
-                || (reading.errorCode !== null && reading.errorCode !== undefined)) {
-                const problem = reading.error === true || (reading.errorCode || 0) > 0;
-                this._publishIfNeeded(
-                    `${base}/${MQTT_TOPIC_SUFFIX_HVAC_PROBLEM}`,
-                    problem ? MQTT_STATE_ON : MQTT_STATE_OFF,
-                    this.mqttOptions
-                );
-            }
-        } else if (reading.kind === 'humidity') {
-            // Zone humidity (spec §25.8.7, 0–100%). Null when the sensor reports
-            // total failure — surface nothing rather than a bogus reading.
-            if (reading.humidity !== null && reading.humidity !== undefined) {
-                this._publishIfNeeded(
-                    `${base}/${MQTT_TOPIC_SUFFIX_HVAC_CURRENT_HUMIDITY}`,
-                    String(reading.humidity),
-                    this.mqttOptions
-                );
-            }
-        } else if (reading.kind === 'humidity_mode') {
-            // Humidity control mode + target (spec §25.8.12). MQTT-only state;
-            // the climate entity reads these as current/target humidity.
-            if (reading.mode !== null && reading.mode !== undefined) {
-                this._publishIfNeeded(
-                    `${base}/${MQTT_TOPIC_SUFFIX_HVAC_HUMIDITY_MODE}`,
-                    reading.mode,
-                    this.mqttOptions
-                );
-            }
-            if (reading.humiditySetpoint !== null && reading.humiditySetpoint !== undefined) {
-                this._publishIfNeeded(
-                    `${base}/${MQTT_TOPIC_SUFFIX_HVAC_HUMIDITY_SETPOINT}`,
-                    String(reading.humiditySetpoint),
-                    this.mqttOptions
-                );
-            }
-        } else if (reading.kind === 'humidity_action') {
-            // Humidity plant running state (spec §25.8.5/§25.6.10).
-            this._publishIfNeeded(
-                `${base}/${MQTT_TOPIC_SUFFIX_HVAC_HUMIDITY_ACTION}`,
-                reading.action,
-                this.mqttOptions
-            );
-        } else if (reading.kind === 'security_zone') {
-            // Security zone state (app 208): the binary_sensor state is ON for
-            // unsealed/open/short and OFF for sealed; the raw 2-bit state name
-            // goes to the JSON attributes topic so automations can distinguish
-            // fault states (open/short) from a normal unsealed zone.
-            //
-            // `isolated` is extra context on the attributes topic only — an
-            // isolated zone that is unsealed is still unsealed, so the state
-            // topic's meaning is untouched. A reading with no zoneState is an
-            // isolation-only update (the panel bypassed a zone without
-            // reporting its state), which publishes attributes and nothing else.
-            const hasZoneState = reading.zoneState !== null && reading.zoneState !== undefined;
-            const isolated = reading.isolated === true;
-            if (hasZoneState) {
-                this._publishIfNeeded(
-                    `${base}/${MQTT_TOPIC_SUFFIX_STATE}`,
-                    reading.zoneState === 'sealed' ? MQTT_STATE_OFF : MQTT_STATE_ON,
-                    this.mqttOptions
-                );
-            }
-            const attributesPayload = hasZoneState
-                ? (isolated ? SECURITY_ZONE_ISOLATED_ATTRIBUTES_PAYLOAD : SECURITY_ZONE_ATTRIBUTES_PAYLOAD)[reading.zoneState]
-                : (isolated ? SECURITY_ZONE_ISOLATED_ONLY_PAYLOAD : SECURITY_ZONE_NO_ATTRIBUTES_PAYLOAD);
-            if (attributesPayload) {
-                this._publishIfNeeded(
-                    `${base}/${MQTT_TOPIC_SUFFIX_ATTRIBUTES}`,
-                    attributesPayload,
-                    this.mqttOptions
-                );
-            }
-        } else if (reading.kind === 'security_panel') {
-            // Panel-wide trouble condition (app 208): ON means the trouble is
-            // present. `group` is the "panel/<condition>" path segment, so the
-            // base already addresses the right topic.
-            this._publishIfNeeded(
-                `${base}/${MQTT_TOPIC_SUFFIX_STATE}`,
-                reading.active ? MQTT_STATE_ON : MQTT_STATE_OFF,
-                this.mqttOptions
-            );
-        } else if (reading.kind === 'security_alarm') {
-            // HA alarm_control_panel state (app 208): one of disarmed,
-            // armed_home/away/night/vacation, arming, pending, triggered.
-            // `group` is "panel", so the base is cbus/read/{net}/{app}/panel.
-            // The blocking zone (arm_not_ready) rides the attributes topic and
-            // is republished on every transition so it clears with the state.
-            this._publishIfNeeded(
-                `${base}/${MQTT_TOPIC_SUFFIX_STATE}`,
-                reading.alarmState,
-                this.mqttOptions
-            );
-            const attributes = reading.blockingZone ? { blocking_zone: reading.blockingZone } : {};
-            this._publishIfNeeded(
-                `${base}/${MQTT_TOPIC_SUFFIX_ATTRIBUTES}`,
-                JSON.stringify(attributes),
-                this.mqttOptions
-            );
-        } else if (reading.kind === 'measurement') {
-            // Measurement application (app 228): `group` is "{device}/{channel}",
-            // so `base` already addresses cbus/read/{net}/{app}/{device}/{channel}.
-            this._publishIfNeeded(
-                `${base}/${MQTT_TOPIC_SUFFIX_VALUE}`,
-                String(reading.value),
-                this.mqttOptions
-            );
-            this._publishIfNeeded(
-                `${base}/${MQTT_TOPIC_SUFFIX_UNIT}`,
-                reading.unit || '',
-                this.mqttOptions
-            );
+        const handler = READING_KIND_HANDLERS[reading.kind];
+        if (handler) {
+            handler(this, base, reading);
         }
     }
 
@@ -629,21 +695,20 @@ class EventPublisher {
         if (rawLevel !== null) {
             // HVAC-via-lighting temperature encoding: level / 2 across a
             // 0-50C range at 0.5C resolution (level 0 = 0.0C, 100 = 50.0C).
-            const tempCelsius = rawLevel / 2;
+            const tempCelsius = cbusLevelToTemperature(rawLevel);
             const tempStr = tempCelsius.toFixed(1);
 
             if (this.logger.isLevelEnabled && this.logger.isLevelEnabled('debug')) {
                 this.logger.debug(`C-Bus HVAC ${source}: ${network}/${application}/${group} level=${rawLevel} temp=${tempStr}°C`);
             }
 
-            // Publish current temperature reading
             this._publishIfNeeded(
                 `${readBase}/${MQTT_TOPIC_SUFFIX_HVAC_CURRENT_TEMP}`,
                 tempStr,
                 this.mqttOptions
             );
 
-            // Publish setpoint (same value — C-Bus level represents the controlled setpoint)
+            // Same value — C-Bus level represents the controlled setpoint.
             this._publishIfNeeded(
                 `${readBase}/${MQTT_TOPIC_SUFFIX_HVAC_SETPOINT}`,
                 tempStr,
