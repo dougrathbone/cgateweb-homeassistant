@@ -180,9 +180,18 @@ const NATIVE_AIRCON_SENSORS = [
         topicSuffix: MQTT_TOPIC_SUFFIX_HVAC_HUMIDITY_MODE
     },
     {
+        // Target humidity is a diagnostic readout, not a climate control: HA
+        // rejects target_humidity_state_topic unless a matching command topic
+        // is also set, and humidity writes are not implemented.
+        suffix: 'humidity_setpoint',
+        name: 'Humidity setpoint',
+        topicSuffix: MQTT_TOPIC_SUFFIX_HVAC_HUMIDITY_SETPOINT,
+        unit: '%',
+        stateClass: 'measurement'
+    },
+    {
         // The humidity counterpart of hvac_action. The climate entity carries
-        // current and target humidity but has no humidity equivalent of
-        // action_topic, so this is the only way to surface it.
+        // current humidity but has no humidity equivalent of action_topic.
         suffix: 'humidity_action',
         name: 'Humidity action',
         topicSuffix: MQTT_TOPIC_SUFFIX_HVAC_HUMIDITY_ACTION
@@ -311,6 +320,12 @@ class _HaDiscoveryPublishers {
     /** @type {Set<string>} */
     _unlistedGroupSeen;
 
+    /** @type {(key: string, topics: Iterable<string>) => void} */
+    _rememberUnlistedGroupTopics;
+
+    /** @type {(key: string) => void} */
+    _retractUnlistedGroupKey;
+
     /** @type {Set<string>} */
     _treeDiscoveredGroups;
 
@@ -332,7 +347,14 @@ class _HaDiscoveryPublishers {
     _currentRunTopics;
 
     /**
-     * Per-run label data snapshot installed by _publishDiscoveryFromTree for
+     * Installed on HaDiscovery; nested unlisted-group publish reuses the tree
+     * run's snapshot and topic set instead of rolling its own.
+     * @type {(fn: (ctx: { outermost: boolean, ownTopics: boolean }) => any) => any}
+     */
+    _withDiscoveryRun;
+
+    /**
+     * Per-run label data snapshot installed by _withDiscoveryRun for
      * the duration of a synchronous discovery run (null outside a run).
      * @type {{ labelMap: Map<string, string>, typeOverrides: Map<string, string>, entityIds: Map<string, string>, exclude: Set<string>, areas: Map<string, string> } | null}
      */
@@ -888,8 +910,8 @@ class _HaDiscoveryPublishers {
      * Opt-in: announce a Home Assistant entity the first time a lighting-style
      * group appears on the bus even if it is missing from the Toolkit project
      * (#63). Off by default because scene addresses and unused groups also
-     * appear in the event stream, and retained discovery configs have to be
-     * cleaned off the broker by hand.
+     * appear in the event stream. Turning the option off retracts leftover
+     * configs (see {@link HaDiscovery#syncUnlistedGroupDiscovery}).
      *
      * @param {string|number} network
      * @param {string|number} appId
@@ -898,67 +920,65 @@ class _HaDiscoveryPublishers {
      */
     ensureUnlistedGroupDiscovery(network, appId, group) {
         if (!this.settings.ha_discovery_enabled) return false;
-        if (!this.settings.ha_discovery_unlisted_groups) return false;
         if (network === null || network === undefined || appId === null || appId === undefined
             || group === null || group === undefined || group === '') {
             return false;
         }
 
         const key = `${network}/${appId}/${group}`;
-        if (this._treeDiscoveredGroups.has(key) || this._unlistedGroupSeen.has(key)) {
+        if (!this.settings.ha_discovery_unlisted_groups) {
+            this._retractUnlistedGroupKey(key);
             return false;
         }
+        if (this._treeDiscoveredGroups.has(key)) return false;
+        if (this.exclude.has(key)) {
+            this._retractUnlistedGroupKey(key);
+            return false;
+        }
+        if (this._unlistedGroupSeen.has(key)) return false;
 
         const isLighting = String(appId) === DEFAULT_CBUS_APP_LIGHTING;
         const typed = getDiscoveryTypeForApp(this.settings, appId);
         if (!isLighting && !typed) return false;
         if (typed === 'trigger') return false;
 
-        const restoreSnapshot = !this._labelSnapshot;
-        if (restoreSnapshot) {
-            this._labelSnapshot = {
-                exclude: this.exclude,
-                labelMap: this.labelMap,
-                typeOverrides: this.typeOverrides,
-                entityIds: this.entityIds,
-                areas: this.areas
-            };
-        }
         // Tree processors finish via _finishTreeEntity, which records topics on
-        // _currentRunTopics rather than _publishedTopics. Own a run set when
-        // this is not already inside a TREEXML pass, then promote those topics
-        // onto the event-driven sets so a later tree scan does not retract them.
-        const ownRunTopics = !this._currentRunTopics;
-        if (ownRunTopics) this._currentRunTopics = new Set();
-        const topicsBefore = this._currentRunTopics.size;
-        this._recordingTreeGroups = false;
-        try {
-            if (isLighting) {
-                this._processOneLightingGroup(network, appId, { GroupAddress: group });
-            } else {
-                this._processEnableControlGroups(network, appId, [{ GroupAddress: group }]);
-            }
-            this._unlistedGroupSeen.add(key);
+        // _currentRunTopics rather than _publishedTopics. _withDiscoveryRun owns
+        // the topic set when this is not already inside a TREEXML pass, then
+        // those topics are promoted onto the event-driven sets so a later tree
+        // scan does not retract them.
+        return this._withDiscoveryRun(({ ownTopics }) => {
+            const topicsBefore = new Set(this._currentRunTopics);
+            this._recordingTreeGroups = false;
+            try {
+                if (isLighting) {
+                    this._processOneLightingGroup(network, appId, { GroupAddress: group });
+                } else {
+                    this._processEnableControlGroups(network, appId, [{ GroupAddress: group }]);
+                }
+                this._unlistedGroupSeen.add(key);
 
-            let published = false;
-            if (ownRunTopics) {
-                for (const topic of this._currentRunTopics) {
-                    this._publishedTopics.add(topic);
-                    this._eventDrivenDiscoveryTopics.add(topic);
+                const added = [...this._currentRunTopics].filter((t) => !topicsBefore.has(t));
+                this._rememberUnlistedGroupTopics(key, added);
+
+                let published = false;
+                if (ownTopics) {
+                    for (const topic of this._currentRunTopics) {
+                        this._publishedTopics.add(topic);
+                        this._eventDrivenDiscoveryTopics.add(topic);
+                        published = true;
+                    }
+                } else if (this._currentRunTopics.size > topicsBefore.size) {
+                    for (const topic of this._currentRunTopics) {
+                        this._eventDrivenDiscoveryTopics.add(topic);
+                    }
                     published = true;
                 }
-            } else if (this._currentRunTopics.size > topicsBefore) {
-                for (const topic of this._currentRunTopics) {
-                    this._eventDrivenDiscoveryTopics.add(topic);
-                }
-                published = true;
+                return published;
+            } finally {
+                this._recordingTreeGroups = true;
             }
-            return published;
-        } finally {
-            this._recordingTreeGroups = true;
-            if (ownRunTopics) this._currentRunTopics = null;
-            if (restoreSnapshot) this._labelSnapshot = null;
-        }
+        });
     }
 
     /**
@@ -1639,14 +1659,10 @@ class _HaDiscoveryPublishers {
                 temperature_state_topic: `${readBase}/${MQTT_TOPIC_SUFFIX_HVAC_SETPOINT}`,
                 mode_state_topic: `${readBase}/${MQTT_TOPIC_SUFFIX_HVAC_MODE}`,
                 action_topic: `${readBase}/${MQTT_TOPIC_SUFFIX_HVAC_ACTION}`,
-                // Humidity state (spec-derived humidity verbs; only populated on
-                // installs with humidity plant). Read-only — no humidity writes.
-                // Note the key is target_humidity_state_topic: the MQTT climate
-                // schema has no "humidity_state_topic" — that key is silently dead.
+                // Current humidity only. HA requires a command topic whenever
+                // target_humidity_state_topic is set, and humidity writes are
+                // not implemented, so the setpoint is a companion sensor.
                 current_humidity_topic: `${readBase}/${MQTT_TOPIC_SUFFIX_HVAC_CURRENT_HUMIDITY}`,
-                target_humidity_state_topic: `${readBase}/${MQTT_TOPIC_SUFFIX_HVAC_HUMIDITY_SETPOINT}`,
-                min_humidity: 0,
-                max_humidity: 100,
                 // Fan mode from the Aux Level (spec §25.6.11 bit 6). HA accepts an
                 // arbitrary fan_modes list; the C-Bus values are automatic/continuous.
                 // (Raw 0-63 fan speed still has no HA climate equivalent, so it stays

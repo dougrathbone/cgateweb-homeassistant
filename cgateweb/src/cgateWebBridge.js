@@ -246,7 +246,7 @@ class CgateWebBridge {
 
         // Decodes security (app 208) event lines and publishes zone state.
         // sendCommand feeds the throttled command queue (security
-        // status_request initial sync only — phase 1 is read-only on the bus).
+        // status_request initial sync; arm/disarm writes are MQTT-routed).
         this.securityEventHandler = new SecurityEventHandler({
             eventPublisher: this.eventPublisher,
             logger: this.logger,
@@ -374,6 +374,8 @@ class CgateWebBridge {
             maxSize: resolveSetting(this.settings, 'maxQueueSize'),
             getIntervalMs: () => this._getAdaptiveQueueIntervalMs(),
             canProcessFn: () => this._canProcessCommandQueue(),
+            retryWhenBlockedMinMs: resolveSetting(this.settings, 'queueRetryWhenBlockedMinMs'),
+            retryWhenBlockedCapMs: resolveSetting(this.settings, 'queueRetryWhenBlockedCapMs'),
             onDrop: (droppedCount, priority, maxSize) => {
                 this.mqttManager.publish(
                     'hello/cgateweb/warnings',
@@ -926,8 +928,14 @@ class CgateWebBridge {
     }
 
     _getAdaptiveQueueIntervalMs() {
-        const baseInterval = Math.max(10, resolveSetting(this.settings, 'messageinterval'));
-        const minInterval = Math.max(5, resolveSetting(this.settings, 'commandMinIntervalMs'));
+        const baseInterval = Math.max(
+            resolveSetting(this.settings, 'messageIntervalMinMs'),
+            resolveSetting(this.settings, 'messageinterval')
+        );
+        const minInterval = Math.max(
+            resolveSetting(this.settings, 'commandMinIntervalFloorMs'),
+            resolveSetting(this.settings, 'commandMinIntervalMs')
+        );
         const stats = this.commandConnectionPool?.getStats?.();
         if (!stats || stats.healthyConnections <= 0) {
             return baseInterval;

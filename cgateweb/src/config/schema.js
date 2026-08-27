@@ -211,6 +211,42 @@ const SETTINGS_SCHEMA = {
         description: 'Floor on the adaptive command interval.',
         reason: TUNING_ONLY_REASON
     },
+    commandMinIntervalFloorMs: {
+        key: 'commandMinIntervalFloorMs',
+        type: 'number',
+        default: 5,
+        unit: 'ms',
+        exposure: 'standalone',
+        description: 'Hard floor applied to commandMinIntervalMs in the adaptive queue (cannot go below this even if commandMinIntervalMs is set lower).',
+        reason: TUNING_ONLY_REASON
+    },
+    messageIntervalMinMs: {
+        key: 'messageIntervalMinMs',
+        type: 'number',
+        default: 10,
+        unit: 'ms',
+        exposure: 'standalone',
+        description: 'Hard floor applied to messageinterval in the adaptive queue.',
+        reason: TUNING_ONLY_REASON
+    },
+    queueRetryWhenBlockedMinMs: {
+        key: 'queueRetryWhenBlockedMinMs',
+        type: 'number',
+        default: 10,
+        unit: 'ms',
+        exposure: 'standalone',
+        description: 'Floor on how soon the command queue retries when C-Gate is not ready to accept another command.',
+        reason: TUNING_ONLY_REASON
+    },
+    queueRetryWhenBlockedCapMs: {
+        key: 'queueRetryWhenBlockedCapMs',
+        type: 'number',
+        default: 200,
+        unit: 'ms',
+        exposure: 'standalone',
+        description: 'Cap on the derived blocked-queue retry delay (min of the command interval and this value) when no explicit retry is set.',
+        reason: TUNING_ONLY_REASON
+    },
     maxQueueSize: {
         key: 'maxQueueSize',
         type: 'number',
@@ -409,6 +445,15 @@ const SETTINGS_SCHEMA = {
         exposure: 'both',
         description: 'Keep-alive interval for the single event connection; takes precedence over keepAliveInterval for that connection.',
         reason: 'Not offered separately in the add-on: connection_keep_alive_interval_sec sets it alongside keepAliveInterval.'
+    },
+    keepAliveIntervalMinMs: {
+        key: 'keepAliveIntervalMinMs',
+        type: 'number',
+        default: 10000,
+        unit: 'ms',
+        exposure: 'standalone',
+        description: 'Floor applied to both pooled-command and event-connection keep-alive ping intervals.',
+        reason: TUNING_ONLY_REASON
     },
     connectionTimeout: {
         key: 'connectionTimeout',
@@ -609,7 +654,7 @@ const SETTINGS_SCHEMA = {
         default: false,
         unit: 'none',
         exposure: 'both',
-        description: 'Announce a Home Assistant entity the first time a lighting-style group appears on the bus even if it is missing from the Toolkit project. Off by default: scene addresses and unused groups also appear in the event stream, and retained discovery configs have to be cleaned off the broker by hand. (#63)'
+        description: 'Announce a Home Assistant entity the first time a lighting-style group appears on the bus even if it is missing from the Toolkit project. Off by default: scene addresses and unused groups also appear in the event stream. Turning this off retracts those leftover discovery configs from the broker. (#63)'
     },
     ha_discovery_trigger_app_id: {
         key: 'ha_discovery_trigger_app_id',
@@ -1381,9 +1426,9 @@ const SETTINGS_SCHEMA = {
         type: 'array',
         default: [],
         unit: 'none',
-        exposure: 'standalone',
-        description: 'Apps whose raw C-Gate event lines should be logged verbatim (and published to cbus/read/{net}/{app}/{group}/raw) for protocol capture. Empty = off.',
-        reason: 'Used to capture ground-truth samples for specialised applications (e.g. 25 Temperature, 228 Measurement, 172 Air Conditioning) before writing decoders. See docs/superpowers/specs/2026-06-02-native-cbus-hvac-support-design.md'
+        exposure: 'both',
+        description: 'Apps whose raw C-Gate event lines should be logged verbatim (and published to cbus/read/{net}/{app}/{group}/raw) for protocol capture. Empty = off. Noisy; leave empty in normal operation.',
+        aliases: ['cbus_raw_event_log_apps']
     }
 };
 
