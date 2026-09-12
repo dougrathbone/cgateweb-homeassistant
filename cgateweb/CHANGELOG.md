@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 If this add-on saves you time, you can [buy me a coffee](https://buymeacoffee.com/dougrathbone).
 
+## [1.34.10] - 2026-09-11
+
+### Fixed
+
+- **The status page reports when it cannot bind.** C-Gate and MQTT stay up; Home Assistant diagnostics show the web UI is down.
+
+### Changed
+
+- Internal: patched js-yaml, HTTP request timeouts on the status page, schema-backed config range warnings, and a Security event verb table.
+
 ## [1.34.9] - 2026-09-11
 
 ### Security
@@ -19,7 +29,7 @@ If this add-on saves you time, you can [buy me a coffee](https://buymeacoffee.co
 
 - Internal: the 1.34.7 changelog heading is restored so release notes stop at the right version.
 
-
+## [1.34.8] - 2026-09-11
 
 ### Fixed
 
