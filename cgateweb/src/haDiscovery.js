@@ -69,6 +69,11 @@ class HaDiscovery {
         this.treeNetwork = null;
         this.discoveryCount = 0;
         this.labelStats = { custom: 0, treexml: 0, fallback: 0 };
+        // Optional: (networkId) => void. Fired when a discovery run finishes
+        // with at least one entity so the bridge can resume polls a pre-sync
+        // 401 stopped even when C-Gate never emits event 762 (issue #122).
+        /** @type {((networkId: string|number) => void)|null} */
+        this.onNetworkDiscovered = null;
         this.logger = createLogger({ component: 'HaDiscovery' });
         // Tracks all discovery config topics published in this session so that
         // stale retained messages can be cleared when devices are excluded or change type.
@@ -172,9 +177,14 @@ class HaDiscovery {
         this._eventDrivenDiscoveryTopics = new Set();
 
         // Session state for bundled Home Assistant device discovery.
+        // Migrated legacy component topics also survive restarts via
+        // device-discovery-migrated.json next to the label file (#133), so a
+        // process restart does not republish standalone configs that HA already
+        // owns through the retained device discovery payload.
         this._deviceDiscoveryCollection = null;
         this._deviceDiscoveryComponents = new Map();
         this._deviceDiscoveryMigratedTopics = new Set();
+        this._loadDeviceDiscoveryMigratedStore();
     }
 
     /**
@@ -232,6 +242,70 @@ class HaDiscovery {
         const labelFile = this.settings && this.settings.cbus_label_file;
         if (!labelFile || typeof labelFile !== 'string') return null;
         return path.join(path.dirname(labelFile), 'unlisted-discovery.json');
+    }
+
+    /**
+     * Path of the device-discovery migration store, or null when no label file
+     * is configured (no writable directory is known). Shared with
+     * HaBridgeDiagnostics (same JSON file, sibling of the label file).
+     * @returns {string|null}
+     * @private
+     */
+    _deviceDiscoveryMigratedStorePath() {
+        const labelFile = this.settings && this.settings.cbus_label_file;
+        if (!labelFile || typeof labelFile !== 'string') return null;
+        return path.join(path.dirname(labelFile), 'device-discovery-migrated.json');
+    }
+
+    /**
+     * Load previously migrated device-discovery component topics so a restart
+     * skips the legacy standalone / migrate_discovery / clear sequence (#133).
+     * @private
+     */
+    _loadDeviceDiscoveryMigratedStore() {
+        const filePath = this._deviceDiscoveryMigratedStorePath();
+        if (!filePath) return;
+        try {
+            const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+            if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return;
+            if (!Array.isArray(parsed.topics)) return;
+            for (const topic of parsed.topics) {
+                if (typeof topic === 'string' && topic.endsWith(CONFIG_TOPIC_SUFFIX)) {
+                    this._deviceDiscoveryMigratedTopics.add(topic);
+                }
+            }
+        } catch (err) {
+            if (err.code !== 'ENOENT') {
+                this.logger.warn(`Could not read device discovery migration store (${err.message}); starting empty`);
+            }
+        }
+    }
+
+    /**
+     * Persist migrated device-discovery topics. Preserves the bridgeDiagnostics
+     * flag written by HaBridgeDiagnostics in the same file.
+     * @private
+     */
+    _persistDeviceDiscoveryMigratedStore() {
+        const filePath = this._deviceDiscoveryMigratedStorePath();
+        if (!filePath) return;
+        try {
+            let bridgeDiagnostics = false;
+            try {
+                const existing = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+                if (existing && typeof existing.bridgeDiagnostics === 'boolean') {
+                    bridgeDiagnostics = existing.bridgeDiagnostics;
+                }
+            } catch (err) {
+                if (err.code !== 'ENOENT') throw err;
+            }
+            fs.writeFileSync(filePath, JSON.stringify({
+                topics: [...this._deviceDiscoveryMigratedTopics],
+                bridgeDiagnostics
+            }, null, 2));
+        } catch (err) {
+            this.logger.warn(`Could not write device discovery migration store (${err.message})`);
+        }
     }
 
     /**
@@ -771,6 +845,12 @@ class HaDiscovery {
             );
         } else {
             this.logger.info(`HA Discovery completed for network ${networkId}. Published ${this.discoveryCount} entities (took ${duration}ms). Labels: ${custom} custom, ${treexml} from TREEXML, ${fallback} fallback`);
+            // Entities mean the network is addressable. Resume any getall poll
+            // a startup 401 retired — discovery succeeding is strong evidence
+            // the network has loaded even when no 762 sync event arrives.
+            if (typeof this.onNetworkDiscovered === 'function') {
+                this.onNetworkDiscovered(networkId);
+            }
         }
     }
 
