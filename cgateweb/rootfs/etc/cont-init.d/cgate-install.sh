@@ -15,14 +15,12 @@ CGATEWEB_DEFAULT_DOWNLOAD_URL="https://download.se.com/files?p_Doc_Ref=C-Gate_3_
 # against this; a user-set cgate_download_sha256 overrides it — the escape
 # hatch if Schneider re-releases the zip and this pin goes stale.
 #
-# Re-pinned 2026-07-27: Schneider repackaged the outer zip on 2026-07-24, which
-# broke every new managed-mode install because the download no longer matched.
-# The inner payload is byte-for-byte the same C-Gate — still cgate-3.3.2_1855.zip
-# — and the bundled release-notes PDF came back named "C-Gate 3 Release Notes
-# (3).pdf", a browser download-collision suffix, so this was a manual re-zip
-# rather than a new C-Gate build. Expect it to recur — which is why the payload
-# pin below exists, so a recurrence no longer waits on an add-on release.
-CGATEWEB_DEFAULT_DOWNLOAD_SHA256="1d871bcd38355234a3b5b30a208463c8be079aa9346152476f2209f516cf271d"
+# Re-pinned 2026-10-03: Schneider re-zipped the outer package again. The inner
+# file is still cgate-3.3.2_1855.zip and its sha256 below is unchanged, so a
+# fresh install kept working through the payload pin. This wrapper pin is what
+# the scheduled download check compares, so it has to follow the file on the
+# server. The July 2026 re-zip was the same kind of change.
+CGATEWEB_DEFAULT_DOWNLOAD_SHA256="8dfb6f9f6d65b4a0242df8a247259a99b781206bf0792167e063a99686617b26"
 # sha256 of the payload *inside* that wrapper (cgate-3.3.2_1855.zip). A re-zip
 # of the wrapper changes the checksum above but not this one, so accepting a
 # match on either means the next repackage does not break fresh installs while
@@ -512,14 +510,34 @@ _cgateweb_force_reinstall_requested() {
     if [[ "${v}" == "true" ]]; then printf '1'; else printf '0'; fi
 }
 
-# Upload-mode auto-upgrade: echo 1 when the newest *.zip in the share dir is
+# The C-Gate zip upload mode will install. Echoes the path of the newest *.zip
+# in the share dir, or nothing when there is none. mtime decides. Equal mtimes
+# keep the name that sorts last, so two files written in the same second do
+# not swap which one is installed on the next boot. find | head is not that
+# choice: it follows directory order.
+_cgateweb_select_upload_zip() {
+    local share_dir="$1"
+    local zip mtime newest="" newest_mtime=-1
+    while IFS= read -r zip; do
+        [[ -n "${zip}" ]] || continue
+        mtime=$(_cgateweb_stat_mtime "${zip}")
+        # Names arrive in C-locale order, so >= keeps the later name on a tie.
+        if [[ -z "${newest}" || "${mtime}" -ge "${newest_mtime}" ]]; then
+            newest="${zip}"
+            newest_mtime="${mtime}"
+        fi
+    done < <(find "${share_dir}" -maxdepth 1 -name '*.zip' -type f 2>/dev/null | LC_ALL=C sort)
+    printf '%s' "${newest}"
+}
+
+# Upload-mode auto-upgrade: echo 1 when the zip that would be installed is
 # newer than the recorded install marker (or no marker exists yet), else 0.
 # Lets a user upgrade simply by dropping a newer C-Gate zip into /share/cgate,
 # mirroring the `-nt` newer-than check used by cgate-project-sync.sh.
 _cgateweb_upload_zip_is_newer() {
     local share_dir="$1" marker="$2"
     local zip
-    zip=$(find "${share_dir}" -maxdepth 1 -name '*.zip' -type f 2>/dev/null | head -1)
+    zip=$(_cgateweb_select_upload_zip "${share_dir}")
     if [[ -z "${zip}" ]]; then printf '0'; return; fi
     if [[ ! -e "${marker}" || "${zip}" -nt "${marker}" ]]; then printf '1'; else printf '0'; fi
 }
@@ -1364,13 +1382,17 @@ elif [[ "${INSTALL_SOURCE}" == "upload" ]]; then
         exit 1
     fi
 
-    ZIP_FILE=$(find "${SHARE_DIR}" -maxdepth 1 -name '*.zip' -type f | head -1)
+    ZIP_FILE=$(_cgateweb_select_upload_zip "${SHARE_DIR}")
     if [[ -z "${ZIP_FILE}" ]]; then
         bashio::log.error "No .zip file found in ${SHARE_DIR}"
         bashio::log.error "Download C-Gate from Clipsal and place the .zip in ${SHARE_DIR}"
         exit 1
     fi
 
+    zip_count=$(find "${SHARE_DIR}" -maxdepth 1 -name '*.zip' -type f | wc -l | tr -d ' ')
+    if [[ "${zip_count}" -gt 1 ]]; then
+        bashio::log.warning "More than one C-Gate zip is in ${SHARE_DIR}; using the newest: ${ZIP_FILE}"
+    fi
     bashio::log.info "Found C-Gate zip: ${ZIP_FILE}"
     bashio::log.info "Extracting..."
     if [[ -n "${DOWNLOAD_SHA256}" ]]; then
